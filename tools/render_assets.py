@@ -658,12 +658,13 @@ def process_lotus(model):
 # ============================================================
 BLOOM_FRAMES = 16       # 開合序列幀數（播放時正放=開、反放=合）
 BLOOM_RES    = 720      # 花苞動畫單張解析度（比靜態小，省檔案）
-BLOOM_CLOSE_PETAL = 80.0   # 外層花瓣收合角度(度)
-BLOOM_CLOSE_INNER = 22.0   # 內層花蕊收合角度(度)
+BLOOM_CLOSE_PETAL = 60.0   # 外層花瓣收合角度(度；不要太大，避免越過垂直往反向翻)
+BLOOM_CLOSE_INNER = 14.0   # 內層花蕊收合角度(度)
 
 
 def lotus_bloom_setup(meshes):
-    """為每片花瓣建立 {基部支點, 切線軸, 收合角}；綠色(萼/葉)隱藏不渲。"""
+    """為每片花瓣建立 {基部支點, 切線軸, 收合角}；綠色(萼/葉)隱藏不渲。
+       收合 = 繞「基部的水平切線軸」把花瓣尖向『中心上方』立起 → 形成尖花苞。"""
     bloom_objs = []
     for o in meshes:
         names = " ".join((s.material.name.lower() if s.material else "") for s in o.material_slots)
@@ -674,7 +675,6 @@ def lotus_bloom_setup(meshes):
     mn, mx = world_bbox(bloom_objs)
     cx = (mn[0] + mx[0]) / 2.0
     cy = (mn[1] + mx[1]) / 2.0
-    cz_base = mn[2]
 
     def horiz(v):
         return math.hypot(v.x - cx, v.y - cy)
@@ -685,20 +685,20 @@ def lotus_bloom_setup(meshes):
         verts = [o.matrix_world @ v.co for v in o.data.vertices]
         if not verts:
             continue
-        base = min(verts, key=lambda v: horiz(v) + (v.z - cz_base) * 0.4)   # 最靠中軸且偏低 = 基部
-        tip = max(verts, key=lambda v: horiz(v))                            # 最遠 = 花瓣尖
-        A = math.atan2(base.y - cy, base.x - cx)
+        base = min(verts, key=horiz)            # 最靠中軸 = 基部(旋轉支點)
+        tip = max(verts, key=horiz)             # 最遠 = 花瓣尖
+        A = math.atan2(tip.y - cy, tip.x - cx)  # 用「尖端」算方位角(穩定，不受 base 太靠中心影響)
         axis = mathutils.Vector((-math.sin(A), math.cos(A), 0.0)).normalized()
         close = math.radians(BLOOM_CLOSE_INNER if is_stamen else BLOOM_CLOSE_PETAL)
 
-        def tip_radius(sign):
-            R = mathutils.Matrix.Rotation(sign * close, 4, axis)
-            ntip = base + (R.to_3x3() @ (tip - base))
-            return math.hypot(ntip.x - cx, ntip.y - cy) - (ntip.z - tip.z) * 0.001
-        sign = 1.0 if tip_radius(1.0) < tip_radius(-1.0) else -1.0          # 取讓花瓣尖向內上收的方向
+        # 選讓花瓣尖「往上＋往中心」收的旋轉方向（避免往下/往外翻）
+        def score(sign):
+            ntip = base + (mathutils.Matrix.Rotation(sign * close, 4, axis).to_3x3() @ (tip - base))
+            return math.hypot(ntip.x - cx, ntip.y - cy) - 2.5 * ntip.z   # 越小=越往中心且越高
+        sign = 1.0 if score(1.0) < score(-1.0) else -1.0
         petals.append({"obj": o, "base": base.copy(), "axis": axis,
                        "ang": sign * close, "orig": o.matrix_world.copy()})
-    return petals, (cx, cy, cz_base)
+    return petals, (cx, cy, mn[2])
 
 
 def apply_bloom(petals, b):
