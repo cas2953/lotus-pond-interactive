@@ -89,6 +89,8 @@ const DEFAULT_CONFIG = {
   flowerCount: 9,  flowerDensity: 0.45, flowerSize: 1.0,
   flowerTilt: 0.0,       // 花朵額外傾角(2.5D 壓扁；0=維持渲染時的角度)
   lightAngle: 135,       // 花朵光照方向(度；於貼圖上疊方向性明暗)
+  lightColor: '#ffe6bd', // 花朵受光側暖光顏色(可調，預設暖陽光)
+  lightStrength: 1.0,    // 花朵方向性打光強度
   leafCount: 9,    leafDensity: 0.45,   leafSize: 1.0,
   fishCount: 9,    fishSpeed: 1.0,      fishReact: 1.0,  fishSize: 1.0,
   weedCount: 10,   weedBlur: 2.2,
@@ -533,22 +535,32 @@ function buildFlora() {
 
 // 依 lightAngle 在每朵「3D 花貼圖」上預烘方向性明暗（只在花的不透明處），結果快取於 it.litImg。
 // 換光向或重建花時才重算，逐幀繪製直接用快取→不影響效能。
+function hexToRgb(hex) {
+  const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex || '');
+  return m ? { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) } : { r: 255, g: 230, b: 189 };
+}
 function relightFlora() {
   const ang = (CONFIG.lightAngle || 0) * Math.PI / 180;
   const lx = Math.cos(ang), ly = Math.sin(ang);
+  const col = hexToRgb(CONFIG.lightColor);
+  const s = clamp(CONFIG.lightStrength != null ? CONFIG.lightStrength : 1, 0, 2);
   for (const it of flora) {
     if (it.type !== 'flower' || !it.img) { it.litImg = null; continue; }
     const im = it.img, w = im.width, h = im.height;
     const c = document.createElement('canvas'); c.width = w; c.height = h;
     const g = c.getContext('2d');
     g.drawImage(im, 0, 0);
-    g.globalCompositeOperation = 'source-atop';                 // 只疊在花瓣上
-    const grad = g.createLinearGradient(w / 2 - lx * w * 0.5, h / 2 - ly * h * 0.5,
-                                        w / 2 + lx * w * 0.5, h / 2 + ly * h * 0.5);
-    grad.addColorStop(0, 'rgba(255,248,228,0.24)');             // 受光側微亮
-    grad.addColorStop(0.5, 'rgba(255,255,255,0)');
-    grad.addColorStop(1, 'rgba(8,26,34,0.26)');                 // 背光側微暗
-    g.fillStyle = grad; g.fillRect(0, 0, w, h);
+    // 受光側：用 lighter 疊暖光(提亮淺色花)；背光側：用 source-atop 疊微暗
+    g.globalCompositeOperation = 'lighter';
+    let gr = g.createLinearGradient(w / 2 - lx * w * 0.5, h / 2 - ly * h * 0.5, w / 2 + lx * w * 0.5, h / 2 + ly * h * 0.5);
+    gr.addColorStop(0, `rgba(${col.r},${col.g},${col.b},${0.34 * s})`);
+    gr.addColorStop(0.55, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    g.globalCompositeOperation = 'source-atop';
+    gr = g.createLinearGradient(w / 2 - lx * w * 0.5, h / 2 - ly * h * 0.5, w / 2 + lx * w * 0.5, h / 2 + ly * h * 0.5);
+    gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(0.55, 'rgba(0,0,0,0)');
+    gr.addColorStop(1, `rgba(8,22,30,${0.20 * s})`);
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
     g.globalCompositeOperation = 'source-over';
     it.litImg = c;
   }
@@ -1007,7 +1019,7 @@ function buildEditor() {
     + 'transition:transform .25s;box-shadow:-8px 0 30px rgba(0,0,0,.45)';
   const groups = [
     ['花', [['flowerCount','數量',0,40,1,'flora'],['flowerDensity','密度',0,1,0.01,'flora'],['flowerSize','大小',0.4,2,0.05,'live'],
-            ['flowerTilt','傾角(2.5D 壓扁)',0,0.5,0.01,'live'],['lightAngle','光照方向(度)',0,360,1,'light']]],
+            ['flowerTilt','傾角(2.5D 壓扁)',0,0.5,0.01,'live'],['lightAngle','光照方向(度)',0,360,1,'light'],['lightStrength','光照強度',0,2,0.05,'light']]],
     ['葉', [['leafCount','數量',0,40,1,'flora'],['leafDensity','密度',0,1,0.01,'flora'],['leafSize','大小',0.4,2,0.05,'live']]],
     ['魚', [['fishCount','數量',0,40,1,'fish'],['fishSpeed','巡游速度',0.2,3,0.05,'live'],['fishReact','受驚反應速度',0.2,3,0.05,'live'],['fishSize','大小',0.4,2,0.05,'live']]],
     ['水草', [['weedCount','數量',0,40,1,'weeds'],['weedBlur','水面下模糊',0,6,0.2,'live']]],
@@ -1025,6 +1037,8 @@ function buildEditor() {
         + `</label>`;
     }
   }
+  // 花·光照顏色（暖陽光，可調）
+  html += `<label style="display:flex;justify-content:space-between;align-items:center;margin:7px 0">花·光照顏色 <input type="color" data-key="lightColor" data-act="light" value="${CONFIG.lightColor}"></label>`;
   // 影片選擇 + 染色 + 後備漸層底色
   html += `<label style="display:flex;justify-content:space-between;align-items:center;margin:7px 0">底圖影片`
     + `<select data-key="bgVideo" data-act="video" style="background:#0a2a2e;color:#dff;border:1px solid rgba(120,200,200,.3);border-radius:4px;padding:2px 6px">`

@@ -536,14 +536,14 @@ def set_world_strength(v):
         pass
 
 
-# 三組打光：暖側光 / 冷側光 / 柔正光 —— 每朵花會分別用不同組打光，產生立體變化
+# 三組打光：全部走「暖陽光」色溫（避免淺色花發暗發灰）；補光也改暖色、提高亮度與環境光
 LOTUS_LIGHTS = [
-    {"key_rot": (30, -24, 0), "key_e": 5.2, "key_col": (1.00, 0.95, 0.86),
-     "fill_rot": (40, 42, 0),  "fill_e": 1.6, "fill_col": (0.78, 0.90, 1.00), "world": 0.50},
-    {"key_rot": (18, 34, 0),  "key_e": 4.4, "key_col": (1.00, 0.90, 0.78),
-     "fill_rot": (44, -34, 0), "fill_e": 1.5, "fill_col": (0.84, 0.92, 1.00), "world": 0.60},
-    {"key_rot": (10, 2, 0),   "key_e": 3.8, "key_col": (1.00, 0.98, 0.93),
-     "fill_rot": (32, 168, 0), "fill_e": 2.2, "fill_col": (0.92, 0.96, 1.00), "world": 0.80},
+    {"key_rot": (32, -22, 0), "key_e": 5.8, "key_col": (1.00, 0.89, 0.72),
+     "fill_rot": (40, 44, 0),  "fill_e": 2.0, "fill_col": (1.00, 0.93, 0.82), "world": 0.78},
+    {"key_rot": (20, 30, 0),  "key_e": 5.2, "key_col": (1.00, 0.87, 0.69),
+     "fill_rot": (44, -34, 0), "fill_e": 1.9, "fill_col": (1.00, 0.95, 0.86), "world": 0.80},
+    {"key_rot": (12, 2, 0),   "key_e": 4.8, "key_col": (1.00, 0.91, 0.77),
+     "fill_rot": (34, 170, 0), "fill_e": 2.4, "fill_col": (1.00, 0.96, 0.90), "world": 0.92},
 ]
 
 
@@ -653,6 +653,108 @@ def process_lotus(model):
 
 
 # ============================================================
+#  荷花苞「開合」動畫：逐片花瓣繞基部旋轉 → 連續幀（0=花苞 .. 1=盛開）
+#  模型為 ~140 片獨立花瓣(無骨架/Shape Key)，故用程式幫每片建立旋轉支點。
+# ============================================================
+BLOOM_FRAMES = 16       # 開合序列幀數（播放時正放=開、反放=合）
+BLOOM_RES    = 720      # 花苞動畫單張解析度（比靜態小，省檔案）
+BLOOM_CLOSE_PETAL = 80.0   # 外層花瓣收合角度(度)
+BLOOM_CLOSE_INNER = 22.0   # 內層花蕊收合角度(度)
+
+
+def lotus_bloom_setup(meshes):
+    """為每片花瓣建立 {基部支點, 切線軸, 收合角}；綠色(萼/葉)隱藏不渲。"""
+    bloom_objs = []
+    for o in meshes:
+        names = " ".join((s.material.name.lower() if s.material else "") for s in o.material_slots)
+        if "green" in names:
+            o.hide_render = True
+        else:
+            bloom_objs.append(o)
+    mn, mx = world_bbox(bloom_objs)
+    cx = (mn[0] + mx[0]) / 2.0
+    cy = (mn[1] + mx[1]) / 2.0
+    cz_base = mn[2]
+
+    def horiz(v):
+        return math.hypot(v.x - cx, v.y - cy)
+
+    petals = []
+    for o in bloom_objs:
+        is_stamen = any(("yellow" in (s.material.name.lower() if s.material else "")) for s in o.material_slots)
+        verts = [o.matrix_world @ v.co for v in o.data.vertices]
+        if not verts:
+            continue
+        base = min(verts, key=lambda v: horiz(v) + (v.z - cz_base) * 0.4)   # 最靠中軸且偏低 = 基部
+        tip = max(verts, key=lambda v: horiz(v))                            # 最遠 = 花瓣尖
+        A = math.atan2(base.y - cy, base.x - cx)
+        axis = mathutils.Vector((-math.sin(A), math.cos(A), 0.0)).normalized()
+        close = math.radians(BLOOM_CLOSE_INNER if is_stamen else BLOOM_CLOSE_PETAL)
+
+        def tip_radius(sign):
+            R = mathutils.Matrix.Rotation(sign * close, 4, axis)
+            ntip = base + (R.to_3x3() @ (tip - base))
+            return math.hypot(ntip.x - cx, ntip.y - cy) - (ntip.z - tip.z) * 0.001
+        sign = 1.0 if tip_radius(1.0) < tip_radius(-1.0) else -1.0          # 取讓花瓣尖向內上收的方向
+        petals.append({"obj": o, "base": base.copy(), "axis": axis,
+                       "ang": sign * close, "orig": o.matrix_world.copy()})
+    return petals, (cx, cy, cz_base)
+
+
+def apply_bloom(petals, b):
+    """b: 0=花苞(完全收合) .. 1=盛開(原始姿態)。"""
+    for p in petals:
+        T = mathutils.Matrix.Translation(p["base"])
+        R = mathutils.Matrix.Rotation(p["ang"] * (1.0 - b), 4, p["axis"])
+        p["obj"].matrix_world = T @ R @ T.inverted() @ p["orig"]
+
+
+def process_lotus_bloom(model):
+    clear_scene()
+    key = make_sun("KeySun")
+    fill = make_sun("FillSun")
+    apply_light(key, fill, LOTUS_LIGHTS[2])          # 柔正光（正俯視）
+    bpy.ops.import_scene.gltf(filepath=model["path"])
+    meshes = [o for o in bpy.data.objects if o.type == 'MESH']
+    if not meshes:
+        log("!! 荷花苞匯入失敗")
+        return {}
+    petals, _ = lotus_bloom_setup(meshes)
+    pink_mats = []
+    for p in petals:
+        for s in p["obj"].material_slots:
+            if s.material and "pink" in s.material.name.lower() and s.material not in pink_mats:
+                pink_mats.append(s.material)
+
+    # 相機固定：以「盛開」最大範圍取景，正上方俯視
+    apply_bloom(petals, 1.0)
+    bpy.context.view_layer.update()
+    mn, mx = world_bbox([p["obj"] for p in petals])
+    center = ((mn[0] + mx[0]) / 2.0, (mn[1] + mx[1]) / 2.0, (mn[2] + mx[2]) / 2.0)
+    size = max(mx[0] - mn[0], mx[1] - mn[1]) * 1.15
+
+    setup_render()
+    bpy.context.scene.render.resolution_x = BLOOM_RES
+    bpy.context.scene.render.resolution_y = BLOOM_RES
+
+    out = {}
+    for cname, rgb in LOTUS_COLORS:
+        if rgb is not None:
+            for m in pink_mats:
+                set_mat_base_color(m, rgb)
+        frames = []
+        for f in range(BLOOM_FRAMES):
+            b = f / (BLOOM_FRAMES - 1)               # 0=花苞 .. 1=盛開
+            apply_bloom(petals, b)
+            bpy.context.view_layer.update()
+            frames.append(render_lotus_view(center, size, 0.0, 0.0,
+                                            "lotus_bloom_%s_%02d.png" % (cname, f)))
+        out[cname] = [p for p in frames if p]
+        log("花苞開合完成:", cname, "共", len(out[cname]), "幀")
+    return out
+
+
+# ============================================================
 #  主流程
 # ============================================================
 def parse_only():
@@ -683,24 +785,33 @@ def main():
     if mathutils is None:
         log("!! 找不到 mathutils,請確認以 Blender 內建 Python 執行。")
         return
-    only = parse_only()
-    manifest = load_manifest() if only else {"flowers": [], "leaves": [], "fish": {}}
+    only = parse_only()                                     # None=全部 / fish / lotus / plant / bloom
+    manifest = load_manifest()                              # 一律沿用既有 manifest，只覆蓋本次重渲的部分
     manifest.setdefault("flowers", [])
     manifest.setdefault("leaves", [])
     manifest.setdefault("fish", {})
+    manifest.setdefault("bloom", {})
     if only:
-        log("== 只重渲:", only, "（其餘類別沿用既有 manifest）==")
+        log("== 只重渲:", only, "（其餘沿用既有 manifest）==")
     for model in MODELS:
-        if only and model["kind"] != only:
+        kind = model["kind"]
+        if only == "bloom":                                 # 花苞開合：只處理 lotus 模型
+            if kind != "lotus":
+                continue
+            if not os.path.isfile(model["path"]):
+                log("!! 找不到檔案,略過:", model["path"]); continue
+            manifest["bloom"] = process_lotus_bloom(model)
+            continue
+        if only and kind != only:
             continue
         if not os.path.isfile(model["path"]):
             log("!! 找不到檔案,略過:", model["path"])
             continue
-        if model["kind"] == "fish":
+        if kind == "fish":
             frames = process_fish(model)
             if frames:
                 manifest["fish"][model["name"]] = {"frames": frames}
-        elif model["kind"] == "lotus":
+        elif kind == "lotus":
             manifest["flowers"] = process_lotus(model)      # 花用荷花模型（多打光×多角度）
         else:
             res = process_plant(model)
