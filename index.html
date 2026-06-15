@@ -1,0 +1,1092 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>荷花池・互動水面</title>
+<style>
+html, body {
+  margin: 0; padding: 0;
+  background: #000;
+  overflow: hidden;
+  width: 100%; height: 100%;
+  touch-action: none;
+  cursor: pointer;
+  font-family: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
+}
+#pond { display: block; width: 100vw; height: 100vh; }
+#hint {
+  position: fixed; left: 50%; bottom: 5vh; transform: translateX(-50%);
+  color: rgba(190, 235, 225, 0.85);
+  font-size: clamp(14px, 1.4vw, 22px);
+  letter-spacing: 0.35em; text-indent: 0.35em;
+  pointer-events: none;
+  text-shadow: 0 0 14px rgba(60, 200, 180, .8);
+  animation: breathe 3.2s ease-in-out infinite;
+  transition: opacity 1.2s ease;
+}
+#hint.hide { opacity: 0; }
+@keyframes breathe { 0%,100% { opacity:.45 } 50% { opacity:1 } }
+#soundBtn {
+  position: fixed; top: 18px; right: 18px;
+  width: 46px; height: 46px; border-radius: 50%;
+  border: 1px solid rgba(150, 220, 210, .35);
+  background: rgba(8, 40, 45, .45);
+  backdrop-filter: blur(6px);
+  color: #cfeee8; font-size: 20px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; user-select: none; z-index: 10;
+  transition: background .25s;
+}
+#soundBtn:hover { background: rgba(20, 80, 85, .6); }
+@media (prefers-reduced-motion: reduce) {
+  #hint { animation: none; opacity: .8; }
+}
+</style>
+</head>
+<body>
+<canvas id="pond"></canvas>
+<div id="hint">觸 碰 水 面 ・ 泛 起 漣 漪</div>
+<div id="soundBtn" title="音效開關">🔊</div>
+<script>
+'use strict';
+/* ============================================================
+   荷花池互動水面 — v2（高度場水波折射版）
+   設計座標：2100 × 900（21:9），自動縮放適配任何螢幕/投影
+
+   水波紋：移植自參考專案「聲音漣漪」的做法 ——
+     · Canvas 2D 高度場波動模擬（previous/current 雙緩衝）
+     · 以高度場梯度（水面法線）折射「整個池底場景」+ 浮雕高光
+     · 改由「觸控」觸發（取代原專案的聲音觸發），另有偶發環境漣漪
+   分層：池水 + 魚＝水下層（被漣漪折射）；荷葉荷花＝水面層（清晰，隨波起伏）
+   音效：Web Audio 即時合成（水滴 + 環境水聲），無外部檔案
+
+   ※ 真實 3D 精靈圖（Blender 渲染輸出）尚未接入；目前花/葉/魚仍為程式繪製，
+     待 tools/render_assets.py 產出 assets/sprites/ 後再替換（見 README 說明）。
+   ============================================================ */
+
+const DESIGN_W = 2100, DESIGN_H = 900;
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+const canvas = document.getElementById('pond');
+const ctx = canvas.getContext('2d');
+let viewScale = 1, viewOX = 0, viewOY = 0, dpr = 1;
+
+/* ---------- 小工具 ---------- */
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const TAU = Math.PI * 2;
+
+/* ---------- 真實 3D 精靈圖（Blender 輸出，可選；需經本地伺服器開啟） ---------- */
+let SPRITES_READY = false;
+const FISH_IMG_SCALE = 1.5;       // 對應 render_assets.py 的 FISH_MARGIN
+
+/* ============================================================
+   可調設定（前台編輯器 E 鍵；存於 localStorage）
+   ============================================================ */
+const DEFAULT_CONFIG = {
+  flowerCount: 9,  flowerDensity: 0.45, flowerSize: 1.0,
+  flowerTilt: 0.0,       // 花朵額外傾角(2.5D 壓扁；0=維持渲染時的角度)
+  lightAngle: 135,       // 花朵光照方向(度；於貼圖上疊方向性明暗)
+  leafCount: 9,    leafDensity: 0.45,   leafSize: 1.0,
+  fishCount: 9,    fishSpeed: 1.0,      fishReact: 1.0,  fishSize: 1.0,
+  weedCount: 10,   weedBlur: 2.2,
+  swirlCount: 40,
+  rippleStrength: 1.0,
+  swayDamping: 0.95,     // 越大→搖晃越持久柔和（低阻尼）
+  swayAmp: 0.55,         // 初始搖晃幅度（越小→點擊瞬間擺動越含蓄）
+  bgVideo: 0,            // 背景影片：0=波紋均勻 / 1=有陽光束
+  bgVideoRate: 0.8,      // 影片播放速率
+  bgTint: '#3f9b86',     // 影片染色（正片疊底→染成荷塘青綠）
+  bgOverlay: 1.0,        // 程式波紋疊加強度
+  bgA: '#1d5e62',        // 無影片時的後備：背景中心色
+  bgB: '#08252c',        // 無影片時的後備：背景邊緣色
+};
+let CONFIG = Object.assign({}, DEFAULT_CONFIG);
+try { CONFIG = Object.assign(CONFIG, JSON.parse(localStorage.getItem('pondConfig') || '{}')); } catch (e) {}
+function saveConfig() { try { localStorage.setItem('pondConfig', JSON.stringify(CONFIG)); } catch (e) {} }
+
+// 已載入的 3D 精靈圖（供場景重建時重新指派）
+const ASSET = { flowers: [], leaves: [], fishSets: [] };
+
+// 在設計空間內隨機散佈 count 個點；density 高→容許更近（更密）
+// avoid：需迴避的圓 [{x,y,r}]（例：花要避開荷葉，避免莖穿過葉的錯誤視覺）
+function scatterPositions(count, density, avoid) {
+  const minDist = lerp(280, 70, clamp(density, 0, 1));
+  const pts = [];
+  const maxTries = count * 120 + 80;
+  let tries = 0;
+  while (pts.length < count && tries < maxTries) {
+    tries++;
+    const x = rand(140, DESIGN_W - 140), y = rand(120, DESIGN_H - 120);
+    let ok = true;
+    for (const p of pts) { if (Math.hypot(p.x - x, p.y - y) < minDist) { ok = false; break; } }
+    if (ok && avoid) {
+      for (const a of avoid) { if (Math.hypot(a.x - x, a.y - y) < a.r) { ok = false; break; } }
+    }
+    if (ok) pts.push({ x, y });
+  }
+  return pts;
+}
+
+/* ============================================================
+   高度場水波（核心：移植自參考專案，折射對象改為池底場景）
+   ============================================================ */
+const SIM_SCALE = 2;                       // 模擬降採樣倍率（越大越省效能、越柔）
+const water = {
+  width: 1, height: 1,
+  previous: new Float32Array(1),
+  current:  new Float32Array(1),
+  damping: 0.986,                          // 餘波衰減（越接近 1 餘波越長）
+};
+// 水下層（被折射）與輸出緩衝，皆為「模擬解析度」
+const srcCanvas = document.createElement('canvas');
+const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
+const bufCanvas = document.createElement('canvas');
+const bufCtx = bufCanvas.getContext('2d', { willReadFrequently: true });
+const weedCanvas = document.createElement('canvas');     // 水草離屏層（模糊後貼回）
+const weedCtx = weedCanvas.getContext('2d');
+let waterImage = null, srcImage = null;
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.floor(innerWidth * dpr);
+  canvas.height = Math.floor(innerHeight * dpr);
+  // 等比縮放置中（黑底，多餘區域自然融入背景）
+  viewScale = Math.min(canvas.width / DESIGN_W, canvas.height / DESIGN_H);
+  viewOX = (canvas.width - DESIGN_W * viewScale) / 2;
+  viewOY = (canvas.height - DESIGN_H * viewScale) / 2;
+  ctx.imageSmoothingEnabled = true;
+
+  // 模擬網格固定在「設計空間」內，與螢幕解析度無關（2100/2 × 900/2 = 1050×450）
+  water.width  = Math.max(2, Math.floor(DESIGN_W / SIM_SCALE));
+  water.height = Math.max(2, Math.floor(DESIGN_H / SIM_SCALE));
+  water.previous = new Float32Array(water.width * water.height);
+  water.current  = new Float32Array(water.width * water.height);
+  srcCanvas.width = water.width;  srcCanvas.height = water.height;
+  bufCanvas.width = water.width;  bufCanvas.height = water.height;
+  weedCanvas.width = water.width; weedCanvas.height = water.height;
+  waterImage = bufCtx.createImageData(water.width, water.height);
+  srcCtx.imageSmoothingEnabled = true;
+  weedCtx.imageSmoothingEnabled = true;
+}
+addEventListener('resize', resize);
+
+// 設計座標 → 模擬網格座標
+const designToSim = (dx, dy) => ({ sx: dx / SIM_SCALE, sy: dy / SIM_SCALE });
+
+// 投入一滴水：在 previous 緩衝寫入餘弦衰減的凹陷（與參考專案一致）
+function addDrop(sx, sy, radius, depth) {
+  const minX = Math.max(1, Math.floor(sx - radius));
+  const maxX = Math.min(water.width - 2, Math.ceil(sx + radius));
+  const minY = Math.max(1, Math.floor(sy - radius));
+  const maxY = Math.min(water.height - 2, Math.ceil(sy + radius));
+  for (let yy = minY; yy <= maxY; yy++) {
+    for (let xx = minX; xx <= maxX; xx++) {
+      const dx = xx - sx, dy = yy - sy;
+      const d = Math.hypot(dx, dy);
+      if (d <= radius) {
+        const falloff = Math.cos(d / radius * Math.PI) * 0.5 + 0.5;
+        water.previous[yy * water.width + xx] -= depth * falloff;
+      }
+    }
+  }
+}
+
+// 波動方程一步 + 邊界反射 + 緩衝交換（與參考專案一致）
+function simulateWater() {
+  const w = water.width, h = water.height;
+  const prev = water.previous, cur = water.current, damping = water.damping;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const v = (prev[i - 1] + prev[i + 1] + prev[i - w] + prev[i + w]) / 2 - cur[i];
+      cur[i] = v * damping;
+    }
+  }
+  for (let x = 1; x < w - 1; x++) {
+    cur[x] = cur[w + x] * 0.92;
+    cur[(h - 1) * w + x] = cur[(h - 2) * w + x] * 0.92;
+  }
+  for (let y = 1; y < h - 1; y++) {
+    cur[y * w] = cur[y * w + 1] * 0.92;
+    cur[y * w + w - 1] = cur[y * w + w - 2] * 0.92;
+  }
+  water.previous = cur;
+  water.current = prev;
+}
+
+// 把高度場梯度（法線）拿來折射 srcImage（池底場景）並加上浮雕高光
+function renderWater() {
+  const w = water.width, h = water.height, field = water.previous;
+  const source = srcImage.data, data = waterImage.data;
+  for (let y = 0; y < h; y++) {
+    const ym = clamp(y - 1, 0, h - 1), yp = clamp(y + 1, 0, h - 1);
+    for (let x = 0; x < w; x++) {
+      const xm = clamp(x - 1, 0, w - 1), xp = clamp(x + 1, 0, w - 1);
+      const i = y * w + x;
+      const gx = field[y * w + xp] - field[y * w + xm];
+      const gy = field[yp * w + x] - field[ym * w + x];
+      const offsetX = Math.round(clamp(gx * 0.035, -14, 14));
+      const offsetY = Math.round(clamp(gy * 0.035, -14, 14));
+      const sX = clamp(x + offsetX, 0, w - 1);
+      const sY = clamp(y + offsetY, 0, h - 1);
+      const si = (sY * w + sX) * 4;
+      const gStrength = clamp(Math.abs(gx) * 0.012 + Math.abs(gy) * 0.012, 0, 1);
+      const shade = clamp(gy * 0.018 - gx * 0.01, -0.18, 0.34);
+      const highlight = gStrength * 54;
+      const p = i * 4;
+      // 來源已是上色場景，故不再加底色偏移，只疊浮雕陰影/高光
+      data[p]     = clamp(source[si]     + shade * 70 + highlight,        0, 255);
+      data[p + 1] = clamp(source[si + 1] + shade * 88 + highlight,        0, 255);
+      data[p + 2] = clamp(source[si + 2] + shade * 98 + highlight * 1.15, 0, 255);
+      data[p + 3] = 255;
+    }
+  }
+  bufCtx.putImageData(waterImage, 0, 0);
+  // 升採樣繪到主畫布的設計矩形內（黑邊保留）
+  ctx.drawImage(bufCanvas, 0, 0, water.width, water.height,
+                viewOX, viewOY, DESIGN_W * viewScale, DESIGN_H * viewScale);
+}
+
+// 取某設計座標處的水面梯度（給水面層的花葉做隨波起伏）
+function fieldGradientAtDesign(dx, dy) {
+  const w = water.width, h = water.height;
+  const x = clamp(Math.round(dx / SIM_SCALE), 1, w - 2);
+  const y = clamp(Math.round(dy / SIM_SCALE), 1, h - 2);
+  const f = water.previous;
+  return {
+    gx: f[y * w + (x + 1)] - f[y * w + (x - 1)],
+    gy: f[(y + 1) * w + x] - f[(y - 1) * w + x],
+  };
+}
+
+/* ============================================================
+   池水底色紋理（離屏預渲染：墨綠／青灰，貼近真實荷花池）
+   ============================================================ */
+function makeWaterTexture(w, h, colA, colB) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(w*0.5, h*0.42, h*0.08, w*0.5, h*0.55, w*0.62);
+  grad.addColorStop(0, colA || '#1d5e62');
+  grad.addColorStop(1, colB || '#08252c');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, w, h);
+  // （曲線光紋改為即時繪製，見 Swirl；底圖只保留漸層 + 焦散細點）
+  for (let i = 0; i < 600; i++) {
+    g.fillStyle = `rgba(190, 245, 235, ${rand(0.05, 0.32)})`;
+    const s = rand(0.6, 2.0);
+    g.fillRect(rand(0, w), rand(0, h), s, s);
+  }
+  return c;
+}
+let waterTex = makeWaterTexture(1050, 450, CONFIG.bgA, CONFIG.bgB);
+
+/* ============================================================
+   背景影片底圖（無縫 Loop）＋ 程式焦散波紋疊加
+   · 兩段影片可在編輯器切換；染成荷塘青綠（正片疊底）；播放速率可調
+   · 影片需經本地伺服器/網站開啟（同源才不會污染 getImageData）
+   · 開不到影片時（如 file:// 直開）自動退回漸層底色 waterTex
+   ============================================================ */
+const BG_VIDEOS = ['assets/video/loop1.mp4', 'assets/video/loop2.mp4'];
+const bgVideoEls = BG_VIDEOS.map((src) => {
+  const v = document.createElement('video');
+  v.src = src; v.muted = true; v.loop = true; v.autoplay = true;
+  v.setAttribute('muted', ''); v.setAttribute('playsinline', '');
+  v.playsInline = true; v.preload = 'auto'; v.style.display = 'none';
+  v._ready = false;
+  v.addEventListener('loadeddata', () => { v._ready = true; });
+  document.body.appendChild(v);
+  return v;
+});
+function currentBgVideo() { return bgVideoEls[clamp(CONFIG.bgVideo | 0, 0, bgVideoEls.length - 1)]; }
+function startBgVideos() {
+  const v = currentBgVideo();
+  if (!v) return;
+  v.playbackRate = clamp(CONFIG.bgVideoRate, 0.1, 4);
+  const p = v.play(); if (p && p.catch) p.catch(() => {});
+}
+
+// 焦散光紋貼圖（柔光胞，含環繞複製→可平移不露邊）
+function makeCausticTexture(s) {
+  const c = document.createElement('canvas'); c.width = s; c.height = s;
+  const g = c.getContext('2d');
+  g.globalCompositeOperation = 'lighter';
+  const blobs = [];
+  for (let i = 0; i < 64; i++) blobs.push({ x: rand(0, s), y: rand(0, s), r: rand(s * 0.05, s * 0.14), a: rand(0.05, 0.15) });
+  for (const b of blobs) {
+    for (const ox of [-s, 0, s]) for (const oy of [-s, 0, s]) {
+      const gr = g.createRadialGradient(b.x + ox, b.y + oy, 0, b.x + ox, b.y + oy, b.r);
+      gr.addColorStop(0, `rgba(220,255,248,${b.a})`); gr.addColorStop(1, 'rgba(220,255,248,0)');
+      g.fillStyle = gr; g.beginPath(); g.arc(b.x + ox, b.y + oy, b.r, 0, TAU); g.fill();
+    }
+  }
+  g.globalCompositeOperation = 'source-over';
+  return c;
+}
+const causticTex = makeCausticTexture(360);
+
+// 繪製水面底圖（影片＋染色＋程式焦散）到模擬解析度的 g
+function drawWaterBase(g, now) {
+  const W = water.width, H = water.height;
+  const v = currentBgVideo();
+  if (v && v._ready && v.readyState >= 2 && v.videoWidth) {
+    const vr = v.videoWidth / v.videoHeight, cr = W / H;
+    let dw, dh;
+    if (vr > cr) { dh = H; dw = H * vr; } else { dw = W; dh = W / vr; }   // cover-fit
+    g.drawImage(v, (W - dw) / 2, (H - dh) / 2, dw, dh);
+    g.globalCompositeOperation = 'multiply';                              // 染成荷塘青綠
+    g.fillStyle = CONFIG.bgTint; g.fillRect(0, 0, W, H);
+    g.globalCompositeOperation = 'source-over';
+  } else {
+    texDrift += 1;
+    const ddx = Math.sin(texDrift * 0.0012) * 14, ddy = Math.cos(texDrift * 0.0009) * 9;
+    g.drawImage(waterTex, -16 + ddx, -10 + ddy, W + 32, H + 20);
+  }
+  // 程式焦散波紋疊加（兩層緩慢反向漂移；疊在底圖上→也會被漣漪折射）
+  const ov = CONFIG.bgOverlay;
+  if (ov > 0.001) {
+    const sc = Math.max(W, H) * 1.25 / causticTex.width;
+    const cw = causticTex.width * sc, ch = causticTex.height * sc;
+    const t = now * 0.001;
+    g.globalCompositeOperation = 'lighter';
+    g.globalAlpha = 0.30 * ov;
+    g.drawImage(causticTex, -((Math.sin(t * 0.05) * 0.5 + 0.5) * (cw - W)), -((Math.cos(t * 0.037) * 0.5 + 0.5) * (ch - H)), cw, ch);
+    g.globalAlpha = 0.22 * ov;
+    g.drawImage(causticTex, -((Math.cos(t * 0.041) * 0.5 + 0.5) * (cw - W)), -((Math.sin(t * 0.058) * 0.5 + 0.5) * (ch - H)), cw, ch);
+    g.globalAlpha = 1;
+    g.globalCompositeOperation = 'source-over';
+  }
+}
+
+/* ============================================================
+   背景曲線光紋（即時繪製：緩慢流動 + 忽明忽暗、時隱時現）
+   ============================================================ */
+class Swirl {
+  constructor() {
+    this.x = rand(-100, DESIGN_W + 100);
+    this.y = rand(-80, DESIGN_H + 80);
+    this.r = rand(40, 170);
+    this.a0 = rand(0, TAU);
+    this.a1 = this.a0 + rand(1.2, 4.6) * (Math.random() < 0.5 ? 1 : -1);
+    this.vx = rand(-0.05, 0.05);
+    this.vy = rand(-0.035, 0.035);
+    this.spin = rand(-0.0003, 0.0003);
+    this.phase = rand(0, TAU);
+    this.fadeSpd = rand(0.00035, 0.0011);   // 各自的明暗週期
+    this.width = rand(1.4, 4.2);
+    this.warm = Math.random() < 0.4;
+  }
+  update(dt) {
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    this.a0 += this.spin * dt; this.a1 += this.spin * dt;
+    this.phase += this.fadeSpd * dt;
+    if (this.x < -200) this.x = DESIGN_W + 200; else if (this.x > DESIGN_W + 200) this.x = -200;
+    if (this.y < -200) this.y = DESIGN_H + 200; else if (this.y > DESIGN_H + 200) this.y = -200;
+  }
+  draw(g) {
+    // 一半時間夾為 0 → 有時消失；其餘平方淡入淡出 → 忽明忽暗
+    const o = Math.max(0, Math.sin(this.phase));
+    if (o <= 0.02) return;
+    const alpha = o * o * 0.2;
+    g.strokeStyle = this.warm ? `rgba(170, 240, 220, ${alpha})` : `rgba(140, 225, 255, ${alpha})`;
+    g.lineWidth = this.width;
+    g.lineCap = 'round';
+    g.beginPath();
+    const steps = 22;
+    for (let s = 0; s <= steps; s++) {
+      const t = s / steps;
+      const ang = this.a0 + (this.a1 - this.a0) * t;
+      const rr = this.r * (1 - t * 0.45);
+      const px = this.x + Math.cos(ang) * rr, py = this.y + Math.sin(ang) * rr * 0.8;
+      s === 0 ? g.moveTo(px, py) : g.lineTo(px, py);
+    }
+    g.stroke();
+  }
+}
+const swirls = [];
+function buildSwirls() {
+  swirls.length = 0;
+  for (let i = 0; i < CONFIG.swirlCount; i++) swirls.push(new Swirl());
+}
+
+/* ============================================================
+   荷花 / 荷葉 sprite（程式預渲染；之後將以 Blender 精靈圖替換）
+   ============================================================ */
+const PALETTES = {
+  pink:      { tip:'#e88da4', base:'#fff0f3' },
+  pinkPeach: { tip:'#dd968c', base:'#ffeae4' },
+  lavender:  { tip:'#cf9be4', base:'#f8eefc' },
+  purple:    { tip:'#bd84d8', base:'#f3e5fb' },
+  gold:      { tip:'#e2b31c', base:'#fff3c0' },
+  lilac:     { tip:'#b6b3e2', base:'#f5f4fd' },
+  white:     { tip:'#c9cfe8', base:'#ffffff' },
+  mint:      { tip:'#96d9ad', base:'#edfbf0' },
+};
+function drawPetal(g, len, w, tip, base) {
+  const grad = g.createLinearGradient(0, 0, len, 0);
+  grad.addColorStop(0, base); grad.addColorStop(0.55, base); grad.addColorStop(1, tip);
+  g.fillStyle = grad;
+  g.beginPath();
+  g.moveTo(0, 0);
+  g.bezierCurveTo(len*0.28, -w, len*0.85, -w*0.55, len, 0);
+  g.bezierCurveTo(len*0.85, w*0.55, len*0.28, w, 0, 0);
+  g.closePath(); g.fill();
+  g.strokeStyle = 'rgba(120, 60, 90, 0.12)'; g.lineWidth = 1; g.stroke();
+}
+function makeFlowerSprite(size, paletteKey, opts = {}) {
+  const p = PALETTES[paletteKey];
+  const tilt     = opts.tilt || 0;          // 0=正俯視；0.28~0.5=傾斜/側開
+  const tiltDir  = opts.tiltDir || 0;       // 傾斜方向
+  const openness = opts.openness != null ? opts.openness : 1;
+  const outerN   = opts.outerN || 13;
+  const innerN   = opts.innerN || 9;
+  const petalW   = opts.petalW || 0.30;
+  const S = Math.ceil(size * 2.6);
+  const c = document.createElement('canvas'); c.width = S; c.height = S;
+  const g = c.getContext('2d'); g.translate(S/2, S/2);
+  if (tilt) { g.rotate(tiltDir); g.scale(1, 1 - tilt); g.rotate(-tiltDir); }  // 沿某方向壓扁＝傾斜
+  // 柔光
+  let glow = g.createRadialGradient(0, 0, size*0.1, 0, 0, size*1.2);
+  glow.addColorStop(0, 'rgba(255,255,255,0.22)'); glow.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = glow; g.beginPath(); g.arc(0, 0, size*1.2, 0, TAU); g.fill();
+  // 外層花瓣
+  for (let i = 0; i < outerN; i++) { g.save(); g.rotate((i/outerN)*TAU + rand(-0.06,0.06)); drawPetal(g, size*rand(0.92,1.05)*openness, size*petalW, p.tip, p.base); g.restore(); }
+  // 內層花瓣
+  for (let i = 0; i < innerN; i++) { g.save(); g.rotate((i/innerN)*TAU + 0.32 + rand(-0.05,0.05)); drawPetal(g, size*rand(0.56,0.66)*(0.7+openness*0.3), size*petalW*0.7, p.tip, p.base); g.restore(); }
+  // 中心光暈
+  glow = g.createRadialGradient(0, 0, 0, 0, 0, size*0.45);
+  glow.addColorStop(0, 'rgba(255,255,250,0.98)'); glow.addColorStop(0.4, 'rgba(255,242,200,0.75)'); glow.addColorStop(1, 'rgba(255,235,180,0)');
+  g.fillStyle = glow; g.beginPath(); g.arc(0, 0, size*0.45, 0, TAU); g.fill();
+  // 花蕊
+  for (let i = 0; i < 14; i++) { const a = rand(0,TAU), r = rand(size*0.04, size*0.14); g.fillStyle = 'rgba(245,195,80,0.9)'; g.beginPath(); g.arc(Math.cos(a)*r, Math.sin(a)*r, size*0.022, 0, TAU); g.fill(); }
+  return c;
+}
+function makePadSprite(r, hue) {
+  const S = Math.ceil(r * 2.3);
+  const c = document.createElement('canvas'); c.width = S; c.height = S;
+  const g = c.getContext('2d'); g.translate(S/2, S/2);
+  const colors = hue === 'yellow' ? ['#cdd34a','#a6b22e','#7d8a20'] : ['#7fc23c','#5aa02a','#3c7a1d'];
+  const grad = g.createRadialGradient(-r*0.15, -r*0.15, r*0.08, 0, 0, r);
+  grad.addColorStop(0, colors[0]); grad.addColorStop(0.6, colors[1]); grad.addColorStop(1, colors[2]);
+  g.fillStyle = grad; g.beginPath(); g.arc(0, 0, r, 0, TAU); g.fill();
+  g.globalCompositeOperation = 'destination-out';
+  g.beginPath(); g.moveTo(0, 0);
+  g.lineTo(r*1.05*Math.cos(-0.16), r*1.05*Math.sin(-0.16));
+  g.lineTo(r*1.05*Math.cos( 0.16), r*1.05*Math.sin( 0.16));
+  g.closePath(); g.fill();
+  g.globalCompositeOperation = 'source-over';
+  g.strokeStyle = 'rgba(30, 70, 20, 0.35)'; g.lineWidth = Math.max(1, r*0.02);
+  const veins = 14;
+  for (let i = 0; i < veins; i++) {
+    const a = 0.25 + (i/veins) * (TAU - 0.5);
+    g.beginPath(); g.moveTo(0, 0);
+    g.quadraticCurveTo(Math.cos(a+0.08)*r*0.5, Math.sin(a+0.08)*r*0.5, Math.cos(a)*r*0.95, Math.sin(a)*r*0.95);
+    g.stroke();
+  }
+  const hl = g.createRadialGradient(-r*0.3, -r*0.3, 0, -r*0.3, -r*0.3, r*0.7);
+  hl.addColorStop(0, 'rgba(220,255,210,0.28)'); hl.addColorStop(1, 'rgba(220,255,210,0)');
+  g.fillStyle = hl; g.beginPath(); g.arc(0, 0, r, 0, TAU); g.fill();
+  return c;
+}
+
+/* ============================================================
+   場景配置（座標基於 2100×900 設計空間）
+   ============================================================ */
+const PASTEL_KEYS = ['pink', 'pinkPeach', 'white', 'gold', 'lavender', 'purple', 'lilac'];
+const flora = [];
+// 依 CONFIG 的數量/密度重建花與葉（葉先入陣列＝畫在花下方）
+function buildFlora() {
+  flora.length = 0;
+  const pads = [];           // 花需迴避的荷葉範圍
+  let li = 0;
+  for (const p of scatterPositions(CONFIG.leafCount, CONFIG.leafDensity)) {
+    const r = rand(40, 92);
+    const hue = Math.random() < 0.25 ? 'yellow' : 'green';
+    const it = { type:'pad', x:p.x, y:p.y, sprite: makePadSprite(r, hue), footprint:r, img:null,
+      phase: rand(0,TAU), spd: rand(0.00018,0.0003), ampX: rand(4,9), ampY: rand(3,7),
+      rot: rand(0,TAU), rotAmp: rand(0.02,0.05), bobX:0, bobY:0 };
+    if (ASSET.leaves.length) it.img = ASSET.leaves[li++ % ASSET.leaves.length];
+    flora.push(it);
+    pads.push({ x:p.x, y:p.y, r: r * 1.1 * CONFIG.leafSize + 55 });   // 花心需離荷葉這麼遠
+  }
+  let fi = 0;
+  for (const p of scatterPositions(CONFIG.flowerCount, CONFIG.flowerDensity, pads)) {
+    const s = rand(60, 80);
+    const palette = PASTEL_KEYS[Math.floor(rand(0, PASTEL_KEYS.length))];
+    const tilt = Math.random() < 0.4 ? rand(0.28, 0.5) : 0;
+    const sprite = makeFlowerSprite(s, palette, {
+      outerN: Math.floor(rand(11, 16)), innerN: Math.floor(rand(7, 11)),
+      openness: rand(0.8, 1.05), petalW: rand(0.26, 0.34), tilt, tiltDir: rand(0, TAU),
+    });
+    const it = { type:'flower', x:p.x, y:p.y, sprite, footprint:s, img:null,
+      phase: rand(0,TAU), spd: rand(0.00015,0.00028), ampX: rand(5,11), ampY: rand(3,8),
+      rot: rand(-Math.PI, Math.PI), rotAmp: tilt ? rand(0.006, 0.014) : rand(0.012, 0.03),
+      bobX:0, bobY:0 };
+    if (ASSET.flowers.length) it.img = ASSET.flowers[fi++ % ASSET.flowers.length];
+    flora.push(it);
+  }
+  relightFlora();
+}
+
+// 依 lightAngle 在每朵「3D 花貼圖」上預烘方向性明暗（只在花的不透明處），結果快取於 it.litImg。
+// 換光向或重建花時才重算，逐幀繪製直接用快取→不影響效能。
+function relightFlora() {
+  const ang = (CONFIG.lightAngle || 0) * Math.PI / 180;
+  const lx = Math.cos(ang), ly = Math.sin(ang);
+  for (const it of flora) {
+    if (it.type !== 'flower' || !it.img) { it.litImg = null; continue; }
+    const im = it.img, w = im.width, h = im.height;
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const g = c.getContext('2d');
+    g.drawImage(im, 0, 0);
+    g.globalCompositeOperation = 'source-atop';                 // 只疊在花瓣上
+    const grad = g.createLinearGradient(w / 2 - lx * w * 0.5, h / 2 - ly * h * 0.5,
+                                        w / 2 + lx * w * 0.5, h / 2 + ly * h * 0.5);
+    grad.addColorStop(0, 'rgba(255,248,228,0.24)');             // 受光側微亮
+    grad.addColorStop(0.5, 'rgba(255,255,255,0)');
+    grad.addColorStop(1, 'rgba(8,26,34,0.26)');                 // 背光側微暗
+    g.fillStyle = grad; g.fillRect(0, 0, w, h);
+    g.globalCompositeOperation = 'source-over';
+    it.litImg = c;
+  }
+}
+
+/* ============================================================
+   魚群（水下層，被漣漪折射；點擊時加速散開）
+   ============================================================ */
+const FISH_COLORS = [
+  ['#ff9d45', '#ffd9a8'], ['#ff7b4d', '#ffc9a0'], ['#e9f3ff', '#ffffff'],
+  ['#ffd23f', '#fff0b0'], ['#ffb1c9', '#ffe4ec'],
+];
+class Fish {
+  constructor() {
+    this.x = rand(350, DESIGN_W - 350);
+    this.y = rand(180, DESIGN_H - 180);
+    this.angle = rand(0, TAU);
+    this.baseSpeed = rand(0.7, 1.15);
+    this.speed = this.baseSpeed;
+    this.len = rand(72, 115);
+    this.turn = 0;
+    this.targetAngle = this.angle;   // 平滑轉向的目標朝向
+    this.wanderTimer = rand(20, 80);
+    this.swayPhase = rand(0, TAU);   // 蜿蜒前進的相位
+    this.phase = rand(0, TAU);
+    this.panic = 0;
+    const c = FISH_COLORS[Math.floor(rand(0, FISH_COLORS.length))];
+    this.c1 = c[0]; this.c2 = c[1];
+    this.depth = rand(0.6, 0.85);
+    this.frames = null;            // 載入精靈圖後為連續幀陣列
+  }
+  scare(px, py) {
+    const dx = this.x - px, dy = this.y - py, d = Math.hypot(dx, dy);
+    if (d > 520) return;
+    const force = 1 - d / 520;
+    // 只設定「逃離方向」為目標，實際轉身交給 update 平滑完成（不再瞬間硬轉）
+    this.targetAngle = Math.atan2(dy, dx) + rand(-0.35, 0.35);
+    this.panic = Math.min(1, this.panic + force * 1.2);
+    this.wanderTimer = rand(30, 70);
+  }
+  update(dt) {
+    this.panic *= Math.pow(0.996, dt);
+    if (this.panic < 0.01) this.panic = 0;
+    // 受驚瞬間略減速（準備轉身）再加速衝出 → 更自然
+    // fishSpeed＝平時巡游速度；fishReact＝被觸發後逃竄的爆發力（兩者獨立可調）
+    const accel = this.panic > 0.6 ? (1.0 - this.panic * 0.25) : 1;
+    this.speed = this.baseSpeed * CONFIG.fishSpeed * (1 + this.panic * 3.0 * CONFIG.fishReact) * accel;
+
+    // 緩慢漫游：偶爾微調目標朝向
+    this.wanderTimer -= dt;
+    if (this.wanderTimer <= 0) {
+      this.targetAngle += rand(-0.7, 0.7) * (1 - this.panic);
+      this.wanderTimer = rand(20, 70);
+    }
+
+    // 邊界：把「目標朝向」導回中央（不直接硬轉角度）
+    const margin = 220, cx = DESIGN_W / 2, cy = DESIGN_H / 2;
+    if (this.x < margin || this.x > DESIGN_W - margin || this.y < margin * 0.7 || this.y > DESIGN_H - margin * 0.7) {
+      this.targetAngle = Math.atan2(cy - this.y, cx - this.x);
+    }
+
+    // 平滑轉向：以有限角速度朝 targetAngle 轉（受驚時轉快但仍連續＝自然轉身）
+    let diff = this.targetAngle - this.angle;
+    while (diff > Math.PI) diff -= TAU;
+    while (diff < -Math.PI) diff += TAU;
+    const maxTurn = (0.045 + this.panic * 0.11 * CONFIG.fishReact) * dt;   // 反應越快→轉身越急
+    this.angle += clamp(diff, -maxTurn, maxTurn);
+    // 蜿蜒前進：路徑緩緩左右擺 → 軌跡更自然（受驚時收斂直奔）
+    this.swayPhase += 0.05 * dt;
+    this.angle += Math.sin(this.swayPhase) * 0.016 * (1 - this.panic * 0.7) * dt;
+
+    this.x += Math.cos(this.angle) * this.speed * dt;
+    this.y += Math.sin(this.angle) * this.speed * dt;
+    // 轉彎幅度越大，尾巴擺動越快 → 轉身更生動
+    this.phase += (0.12 + this.panic * 0.25 + Math.abs(diff) * 0.06) * dt;
+  }
+  draw(g) {
+    if (SPRITES_READY && this.frames && this.frames.length) { this.drawSprite(g); return; }
+    const L = this.len * CONFIG.fishSize, wag = Math.sin(this.phase) * 0.35;
+    g.save();
+    g.translate(this.x, this.y);
+    g.rotate(this.angle);
+    g.globalAlpha = this.depth;
+    g.shadowColor = 'rgba(0, 30, 40, 0.5)'; g.shadowBlur = 12; g.shadowOffsetY = 6;
+    const grad = g.createLinearGradient(L*0.5, 0, -L*0.5, 0);
+    grad.addColorStop(0, this.c2); grad.addColorStop(0.45, this.c1); grad.addColorStop(1, this.c1);
+    g.fillStyle = grad;
+    g.beginPath();
+    g.moveTo(L*0.5, 0);
+    g.bezierCurveTo(L*0.35, -L*0.17, -L*0.1, -L*0.15, -L*0.35, wag*L*0.1 - L*0.04);
+    g.quadraticCurveTo(-L*0.42, wag*L*0.12, -L*0.35, wag*L*0.1 + L*0.04);
+    g.bezierCurveTo(-L*0.1, L*0.15, L*0.35, L*0.17, L*0.5, 0);
+    g.closePath(); g.fill();
+    const tx = -L*0.38, ty = wag * L * 0.12, sway = Math.sin(this.phase - 0.9) * 0.5;
+    g.beginPath();
+    g.moveTo(tx, ty);
+    g.quadraticCurveTo(tx - L*0.28, ty + sway*L*0.2 - L*0.16, tx - L*0.34, ty + sway*L*0.28 - L*0.10);
+    g.quadraticCurveTo(tx - L*0.18, ty + sway*L*0.16, tx - L*0.34, ty + sway*L*0.28 + L*0.10);
+    g.quadraticCurveTo(tx - L*0.28, ty + sway*L*0.2 + L*0.16, tx, ty);
+    g.closePath(); g.fill();
+    g.globalAlpha = this.depth * 0.7;
+    for (const side of [-1, 1]) {
+      g.beginPath();
+      g.moveTo(L*0.12, side*L*0.12);
+      g.quadraticCurveTo(L*0.0, side*L*0.30, -L*0.12, side*(L*0.22 + Math.sin(this.phase+side)*L*0.05));
+      g.quadraticCurveTo(L*0.02, side*L*0.16, L*0.12, side*L*0.12);
+      g.closePath(); g.fill();
+    }
+    g.restore();
+  }
+  drawSprite(g) {
+    const frames = this.frames;
+    let t = (this.phase / TAU) % 1; if (t < 0) t += 1;
+    const im = frames[Math.floor(t * frames.length) % frames.length];
+    if (!im) return;
+    const w = this.len * FISH_IMG_SCALE * CONFIG.fishSize, h = w * (im.height / im.width);
+    g.save();
+    g.translate(this.x, this.y);
+    g.rotate(this.angle);
+    g.globalAlpha = this.depth;
+    g.shadowColor = 'rgba(0, 30, 40, 0.5)'; g.shadowBlur = 12; g.shadowOffsetY = 6;
+    g.drawImage(im, -w / 2, -h / 2, w, h);
+    g.restore();
+  }
+}
+const fishes = [];
+function buildFish() {
+  fishes.length = 0;
+  for (let i = 0; i < CONFIG.fishCount; i++) fishes.push(new Fish());
+  let i = 0;
+  if (ASSET.fishSets.length) for (const f of fishes) f.frames = ASSET.fishSets[i++ % ASSET.fishSets.length];
+}
+
+/* ---------- 載入 Blender 精靈圖（assets/sprites/manifest.json 存在時啟用；否則維持程式繪製） ---------- */
+function loadImage(src) {
+  return new Promise((res) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => res(null); im.src = src; });
+}
+async function initSprites() {
+  try {
+    const r = await fetch('assets/sprites/manifest.json', { cache: 'no-store' });
+    if (!r.ok) return;
+    const mf = await r.json();
+    ASSET.flowers = (await Promise.all((mf.flowers || []).map(loadImage))).filter(Boolean);
+    ASSET.leaves  = (await Promise.all((mf.leaves  || []).map(loadImage))).filter(Boolean);
+    ASSET.fishSets = [];
+    for (const k of Object.keys(mf.fish || {})) {
+      const frames = (await Promise.all((mf.fish[k].frames || []).map(loadImage))).filter(Boolean);
+      if (frames.length) ASSET.fishSets.push(frames);
+    }
+    SPRITES_READY = !!(ASSET.flowers.length || ASSET.leaves.length || ASSET.fishSets.length);
+    if (SPRITES_READY) {
+      buildFlora(); buildFish();   // 用 3D 精靈圖重建
+      console.log('[pond] 已載入 3D 精靈圖', { flowers: ASSET.flowers.length, leaves: ASSET.leaves.length, fishSets: ASSET.fishSets.length });
+    }
+  } catch (e) { /* 維持程式繪製（例如以 file:// 直接開檔時 fetch 會失敗） */ }
+}
+initSprites();
+
+/* ============================================================
+   水下枝葉 / 水草（水下層，被漣漪折射，隨波搖擺）
+   ============================================================ */
+class Weed {
+  constructor(x, y) {
+    this.x = x; this.y = y;
+    this.blades = [];
+    const n = Math.floor(rand(4, 7));
+    for (let i = 0; i < n; i++) {
+      this.blades.push({
+        len: rand(70, 155), ang: rand(-0.95, 0.95), w: rand(8, 16),
+        phase: rand(0, TAU), spd: rand(0.0008, 0.0016), sway: rand(0.18, 0.42),
+        dark: rand(0, 1),
+      });
+    }
+    this.depth = rand(0.30, 0.5);    // 透明度（越小＝看起來越深）
+  }
+  draw(g, time) {
+    const mo = reduceMotion ? 0.35 : 1;
+    const { gx } = fieldGradientAtDesign(this.x, this.y);
+    const rippleSway = clamp(gx * 0.02, -0.5, 0.5);   // 漣漪經過時額外擺動
+    g.save();
+    g.translate(this.x, this.y);
+    g.globalAlpha = this.depth;
+    for (const b of this.blades) {
+      const dir = b.ang + (Math.sin(time * b.spd + b.phase) * b.sway + rippleSway) * mo;
+      const L = b.len;
+      const bx = Math.sin(b.ang), by = -Math.cos(b.ang);   // 下半段沿基礎方向（向上＝ -Y）
+      const midx = bx * L * 0.5, midy = by * L * 0.5;
+      const tipx = midx + Math.sin(dir) * L * 0.5;         // 上半段隨擺動
+      const tipy = midy - Math.cos(dir) * L * 0.5;
+      const px = Math.cos(b.ang), py = Math.sin(b.ang);    // 寬度方向
+      const half = b.w * 0.5;
+      g.fillStyle = b.dark > 0.5 ? 'rgba(30, 86, 56, 0.92)' : 'rgba(22, 66, 44, 0.92)';
+      g.beginPath();
+      g.moveTo(px * half, py * half);
+      g.quadraticCurveTo(midx + px * half * 0.6, midy + py * half * 0.6, tipx, tipy);
+      g.quadraticCurveTo(midx - px * half * 0.6, midy - py * half * 0.6, -px * half, -py * half);
+      g.closePath();
+      g.fill();
+    }
+    g.restore();
+  }
+}
+const weeds = [];
+function buildWeeds() {
+  weeds.length = 0;
+  for (let i = 0; i < CONFIG.weedCount; i++) weeds.push(new Weed(rand(120, DESIGN_W - 120), rand(120, DESIGN_H - 120)));
+}
+
+/* ============================================================
+   觸碰閃光（水面層，短暫的中心亮點）
+   ============================================================ */
+const flashes = [];
+function spawnFlash(dx, dy, strength) { flashes.push({ x: dx, y: dy, t: 0, max: 520, strength }); }
+function drawFlashes(g, elapsed) {
+  for (let i = flashes.length - 1; i >= 0; i--) {
+    const f = flashes[i]; f.t += elapsed;
+    const prog = f.t / f.max;
+    if (prog >= 1) { flashes.splice(i, 1); continue; }
+    const r = 50 * f.strength * (0.4 + prog);
+    const a = (1 - prog) * 0.5 * f.strength;
+    const fl = g.createRadialGradient(f.x, f.y, 0, f.x, f.y, r);
+    fl.addColorStop(0, `rgba(220, 255, 250, ${a})`);
+    fl.addColorStop(1, 'rgba(220, 255, 250, 0)');
+    g.fillStyle = fl; g.beginPath(); g.arc(f.x, f.y, r, 0, TAU); g.fill();
+  }
+}
+
+/* ============================================================
+   音效（Web Audio 即時合成）
+   ============================================================ */
+let audioCtx = null, ambientGain = null, soundOn = true;
+const soundBtn = document.getElementById('soundBtn');
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const dur = 4;
+  const buf = audioCtx.createBuffer(1, audioCtx.sampleRate * dur, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  let last = 0;
+  for (let i = 0; i < data.length; i++) { const white = Math.random()*2-1; last = (last + 0.02*white)/1.02; data[i] = last*3.2; }
+  const src = audioCtx.createBufferSource(); src.buffer = buf; src.loop = true;
+  const lp = audioCtx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=420; lp.Q.value=0.6;
+  ambientGain = audioCtx.createGain(); ambientGain.gain.value = 0.055;
+  const lfo = audioCtx.createOscillator(); const lfoGain = audioCtx.createGain();
+  lfo.frequency.value = 0.13; lfoGain.gain.value = 0.02;
+  lfo.connect(lfoGain); lfoGain.connect(ambientGain.gain); lfo.start();
+  src.connect(lp); lp.connect(ambientGain); ambientGain.connect(audioCtx.destination); src.start();
+}
+function playDrop(volume = 1) {
+  if (!audioCtx || !soundOn) return;
+  const t = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator(); const og = audioCtx.createGain();
+  const f0 = rand(520, 760);
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(f0, t);
+  osc.frequency.exponentialRampToValueAtTime(f0 * 0.32, t + 0.16);
+  og.gain.setValueAtTime(0.0001, t);
+  og.gain.exponentialRampToValueAtTime(0.28 * volume, t + 0.012);
+  og.gain.exponentialRampToValueAtTime(0.0001, t + 0.32);
+  osc.connect(og); og.connect(audioCtx.destination); osc.start(t); osc.stop(t + 0.4);
+  const nb = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.1, audioCtx.sampleRate);
+  const nd = nb.getChannelData(0);
+  for (let i = 0; i < nd.length; i++) nd[i] = (Math.random()*2-1) * (1 - i/nd.length);
+  const ns = audioCtx.createBufferSource(); ns.buffer = nb;
+  const hp = audioCtx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=1800;
+  const ng = audioCtx.createGain();
+  ng.gain.setValueAtTime(0.09 * volume, t);
+  ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.1);
+  ns.connect(hp); hp.connect(ng); ng.connect(audioCtx.destination); ns.start(t);
+}
+soundBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  initAudio();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  soundOn = !soundOn;
+  if (ambientGain) ambientGain.gain.value = soundOn ? 0.055 : 0;
+  soundBtn.textContent = soundOn ? '🔊' : '🔇';
+});
+
+/* ============================================================
+   互動
+   ============================================================ */
+const hint = document.getElementById('hint');
+let interacted = false;
+function pointerToDesign(clientX, clientY) {
+  return { x: (clientX * dpr - viewOX) / viewScale, y: (clientY * dpr - viewOY) / viewScale };
+}
+function trigger(clientX, clientY, strength = 1) {
+  const { x, y } = pointerToDesign(clientX, clientY);
+  // 僅在設計範圍內才有效（避免黑邊觸發）
+  if (x < 0 || x > DESIGN_W || y < 0 || y > DESIGN_H) return;
+  const { sx, sy } = designToSim(x, y);
+  addDrop(sx, sy, lerp(8, 16, strength), lerp(360, 620, strength) * CONFIG.rippleStrength);
+  spawnFlash(x, y, strength);
+  for (const f of fishes) f.scare(x, y);
+  initAudio();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  startBgVideos();                         // 確保底圖影片開始播放（行動裝置需手勢）
+  playDrop(strength);
+  if (!interacted) { interacted = true; hint.classList.add('hide'); }
+}
+canvas.addEventListener('pointerdown', (e) => trigger(e.clientX, e.clientY, 1));
+canvas.addEventListener('touchstart', (e) => {
+  if (e.touches.length > 1) for (let i = 1; i < e.touches.length; i++) trigger(e.touches[i].clientX, e.touches[i].clientY, 1);
+}, { passive: true });
+
+/* ---------- 環境漣漪（偶發） ---------- */
+let nextAmbient = 3000;
+function ambientRipple(elapsed) {
+  nextAmbient -= elapsed;
+  if (nextAmbient <= 0) {
+    nextAmbient = rand(4500, 9000);
+    const dx = rand(DESIGN_W * 0.15, DESIGN_W * 0.85);
+    const dy = rand(DESIGN_H * 0.15, DESIGN_H * 0.85);
+    const { sx, sy } = designToSim(dx, dy);
+    addDrop(sx, sy, rand(5, 9), rand(120, 220) * CONFIG.rippleStrength);
+    playDrop(0.3);
+  }
+}
+
+/* ============================================================
+   主迴圈
+   ============================================================ */
+let lastTime = performance.now();
+let texDrift = 0;
+let _capFrames = (location.search.indexOf('cap') >= 0) ? 360 : Infinity;   // 截圖驗證用：跑數秒後停止排程
+
+function frame(now) {
+  const elapsed = Math.min(now - lastTime, 50);
+  const dt = elapsed / 16.67;
+  lastTime = now;
+
+  /* --- 更新 --- */
+  for (const f of fishes) f.update(reduceMotion ? dt * 0.4 : dt);
+  ambientRipple(elapsed);
+  simulateWater();
+
+  /* --- 繪製池底場景（水下層）到模擬解析度的 srcCanvas --- */
+  srcCtx.setTransform(1, 0, 0, 1, 0, 0);
+  srcCtx.clearRect(0, 0, water.width, water.height);
+  // 水面底圖：影片(染荷塘青綠) ＋ 程式焦散波紋（開不到影片時退回漸層）
+  drawWaterBase(srcCtx, now);
+  // 背景曲線光紋（直接畫於模擬空間）
+  srcCtx.setTransform(1 / SIM_SCALE, 0, 0, 1 / SIM_SCALE, 0, 0);
+  for (const sw of swirls) { sw.update(reduceMotion ? dt * 0.3 : dt); sw.draw(srcCtx); }
+  srcCtx.setTransform(1, 0, 0, 1, 0, 0);
+  // 水下枝葉：先畫到離屏層，再以模糊貼回（從上往下看水面下的柔焦感）
+  weedCtx.setTransform(1, 0, 0, 1, 0, 0);
+  weedCtx.clearRect(0, 0, water.width, water.height);
+  weedCtx.setTransform(1 / SIM_SCALE, 0, 0, 1 / SIM_SCALE, 0, 0);
+  for (const wd of weeds) wd.draw(weedCtx, now);
+  weedCtx.setTransform(1, 0, 0, 1, 0, 0);
+  srcCtx.filter = CONFIG.weedBlur > 0.01 ? `blur(${CONFIG.weedBlur}px)` : 'none';
+  srcCtx.drawImage(weedCanvas, 0, 0);
+  srcCtx.filter = 'none';
+  // 魚（清晰，畫在水草之上）
+  srcCtx.setTransform(1 / SIM_SCALE, 0, 0, 1 / SIM_SCALE, 0, 0);
+  for (const f of fishes) f.draw(srcCtx);
+  srcCtx.setTransform(1, 0, 0, 1, 0, 0);
+  srcImage = srcCtx.getImageData(0, 0, water.width, water.height);
+
+  /* --- 清主畫布 --- */
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  /* --- 折射輸出：水下層經高度場折射貼到設計矩形 --- */
+  renderWater();
+
+  /* --- 水面層：荷葉荷花（清晰，隨真實水面梯度起伏） --- */
+  ctx.setTransform(viewScale, 0, 0, viewScale, viewOX, viewOY);
+  const t = now;
+  for (const it of flora) {
+    const drift = reduceMotion ? 0.25 : 1;
+    const { gx, gy } = fieldGradientAtDesign(it.x, it.y);
+    // 魚游過時的尾流（較輕，不劇烈）
+    let wx = 0, wy = 0, wrT = 0;
+    const R = 175;
+    for (const f of fishes) {
+      const dx = it.x - f.x, dy = it.y - f.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < R * R) {
+        const d = Math.sqrt(d2) || 1;
+        const inf = (1 - d / R) * (0.6 + f.speed);
+        wx += Math.cos(f.angle) * inf * 1.4;
+        wy += Math.sin(f.angle) * inf * 1.4;
+        const side = (dx * Math.sin(f.angle) - dy * Math.cos(f.angle)) > 0 ? 1 : -1;
+        wrT += side * inf * 0.012;
+      }
+    }
+    // 擾動目標（漣漪 + 魚尾流）；swayAmp 縮放初始幅度（點擊瞬間更含蓄），持久度由 damping 決定
+    const sAmp = CONFIG.swayAmp;
+    const distX = (clamp(gx * 0.45, -8, 8) + wx) * sAmp;
+    const distY = (clamp(gy * 0.45, -8, 8) + wy) * sAmp;
+    // 低阻尼彈簧：搖晃柔和且持久（阻尼由編輯器 swayDamping 調整）
+    const damp = CONFIG.swayDamping;
+    it.velX = (it.velX || 0) + (distX - (it.swayX || 0)) * 0.015; it.velX *= damp; it.swayX = (it.swayX || 0) + it.velX;
+    it.velY = (it.velY || 0) + (distY - (it.swayY || 0)) * 0.015; it.velY *= damp; it.swayY = (it.swayY || 0) + it.velY;
+    it.velR = (it.velR || 0) + (clamp(wrT * sAmp, -0.08, 0.08) - (it._wr || 0)) * 0.015; it.velR *= damp; it._wr = (it._wr || 0) + it.velR;
+    it.bobX = Math.sin(t * it.spd + it.phase) * it.ampX * drift + it.swayX;
+    it.bobY = Math.cos(t * it.spd * 0.8 + it.phase * 1.7) * it.ampY * drift + it.swayY;
+    const rot = it.rot + Math.sin(t * it.spd * 0.6 + it.phase) * it.rotAmp * drift + it._wr;
+    const sizeMul = it.type === 'flower' ? CONFIG.flowerSize : CONFIG.leafSize;
+    ctx.save();
+    ctx.translate(it.x + it.bobX, it.y + it.bobY);
+    // 花朵額外傾角：螢幕空間垂直壓扁（先壓扁再旋轉＝像微傾的花在水面上自轉）
+    if (it.type === 'flower' && CONFIG.flowerTilt > 0.001) ctx.scale(1, 1 - clamp(CONFIG.flowerTilt, 0, 0.5));
+    ctx.rotate(rot);
+    if (SPRITES_READY && it.img) {
+      const im = (it.type === 'flower' && it.litImg) ? it.litImg : it.img;   // 方向性打光快取
+      const w = it.footprint * (it.type === 'flower' ? 2.2 : 2.1) * sizeMul;
+      const h = w * (im.height / im.width);
+      ctx.drawImage(im, -w / 2, -h / 2, w, h);
+    } else {
+      const sp = it.sprite;
+      ctx.drawImage(sp, -sp.width / 2 * sizeMul, -sp.height / 2 * sizeMul, sp.width * sizeMul, sp.height * sizeMul);
+    }
+    ctx.restore();
+  }
+
+  /* --- 觸碰閃光 --- */
+  ctx.globalCompositeOperation = 'lighter';
+  drawFlashes(ctx, elapsed);
+  ctx.globalCompositeOperation = 'source-over';
+
+  /* --- 邊緣黑色暈影 --- */
+  const vg = ctx.createRadialGradient(DESIGN_W/2, DESIGN_H/2, DESIGN_H*0.42, DESIGN_W/2, DESIGN_H/2, DESIGN_W*0.58);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(0.62, 'rgba(0,0,0,0.22)');
+  vg.addColorStop(1, 'rgba(0,0,0,1)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(-100, -100, DESIGN_W + 200, DESIGN_H + 200);
+
+  if (_capFrames !== Infinity && _capFrames === 60 && !window._capDone) {
+    window._capDone = true;                       // 截圖驗證：把畫面快照成靜態 <img>，避免 headless 不合成 live canvas
+    try {
+      const im = new Image();
+      im.src = canvas.toDataURL('image/png');
+      im.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;z-index:9999';
+      document.body.appendChild(im);
+    } catch (e) { console.log('[cap] snapshot fail', e.message); }
+  }
+  if (--_capFrames > 0) requestAnimationFrame(frame);
+}
+
+/* ============================================================
+   隱藏前台編輯器（按 E 開關；設定自動存於 localStorage）
+   ============================================================ */
+function buildEditor() {
+  const panel = document.createElement('div');
+  panel.id = 'editor';
+  panel.style.cssText = 'position:fixed;top:0;right:0;height:100vh;width:300px;overflow-y:auto;'
+    + 'background:rgba(6,24,28,.92);backdrop-filter:blur(8px);color:#dff;box-sizing:border-box;'
+    + 'font:13px/1.5 "Noto Sans TC","Microsoft JhengHei",sans-serif;padding:16px 18px;'
+    + 'border-left:1px solid rgba(120,200,200,.25);z-index:50;transform:translateX(100%);'
+    + 'transition:transform .25s;box-shadow:-8px 0 30px rgba(0,0,0,.45)';
+  const groups = [
+    ['花', [['flowerCount','數量',0,40,1,'flora'],['flowerDensity','密度',0,1,0.01,'flora'],['flowerSize','大小',0.4,2,0.05,'live'],
+            ['flowerTilt','傾角(2.5D 壓扁)',0,0.5,0.01,'live'],['lightAngle','光照方向(度)',0,360,1,'light']]],
+    ['葉', [['leafCount','數量',0,40,1,'flora'],['leafDensity','密度',0,1,0.01,'flora'],['leafSize','大小',0.4,2,0.05,'live']]],
+    ['魚', [['fishCount','數量',0,40,1,'fish'],['fishSpeed','巡游速度',0.2,3,0.05,'live'],['fishReact','受驚反應速度',0.2,3,0.05,'live'],['fishSize','大小',0.4,2,0.05,'live']]],
+    ['水草', [['weedCount','數量',0,40,1,'weeds'],['weedBlur','水面下模糊',0,6,0.2,'live']]],
+    ['漣漪 / 搖晃 / 背景光紋', [['rippleStrength','漣漪強度',0.3,2,0.05,'live'],['swayAmp','搖晃幅度(初始)',0.1,1.5,0.05,'live'],['swayDamping','搖晃阻尼(越大越持久)',0.85,0.99,0.005,'live'],['swirlCount','背景光紋數量',0,140,2,'swirls']]],
+    ['背景水面（影片底圖）', [['bgOverlay','程式波紋疊加',0,2,0.05,'live'],['bgVideoRate','影片播放速率',0.2,2,0.05,'rate']]],
+  ];
+  let html = '<div style="font-size:15px;letter-spacing:.12em;margin-bottom:2px">展項編輯器</div>'
+    + '<div style="opacity:.55;margin-bottom:6px;font-size:12px">按 E 開關 ・ 設定自動儲存</div>';
+  for (const [title, items] of groups) {
+    html += `<div style="margin:13px 0 4px;font-weight:700;color:#9fe;border-bottom:1px solid rgba(120,200,200,.2);padding-bottom:3px">${title}</div>`;
+    for (const [key, label, min, max, step, act] of items) {
+      html += `<label style="display:block;margin:7px 0">`
+        + `<span style="display:flex;justify-content:space-between"><span>${label}</span><b data-out="${key}">${CONFIG[key]}</b></span>`
+        + `<input type="range" data-key="${key}" data-act="${act}" min="${min}" max="${max}" step="${step}" value="${CONFIG[key]}" style="width:100%">`
+        + `</label>`;
+    }
+  }
+  // 影片選擇 + 染色 + 後備漸層底色
+  html += `<label style="display:flex;justify-content:space-between;align-items:center;margin:7px 0">底圖影片`
+    + `<select data-key="bgVideo" data-act="video" style="background:#0a2a2e;color:#dff;border:1px solid rgba(120,200,200,.3);border-radius:4px;padding:2px 6px">`
+    + `<option value="0">波紋均勻</option><option value="1">有陽光束</option></select></label>`
+    + `<label style="display:flex;justify-content:space-between;align-items:center;margin:7px 0">影片染色 <input type="color" data-key="bgTint" data-act="live" value="${CONFIG.bgTint}"></label>`
+    + `<div style="margin:13px 0 4px;font-weight:700;color:#9fe;border-bottom:1px solid rgba(120,200,200,.2);padding-bottom:3px">後備底色（無影片時）</div>`
+    + `<label style="display:flex;justify-content:space-between;align-items:center;margin:7px 0">中心色 <input type="color" data-key="bgA" data-act="water" value="${CONFIG.bgA}"></label>`
+    + `<label style="display:flex;justify-content:space-between;align-items:center;margin:7px 0">邊緣色 <input type="color" data-key="bgB" data-act="water" value="${CONFIG.bgB}"></label>`
+    + `<button id="edReset" style="margin-top:16px;width:100%;padding:8px;background:rgba(120,200,200,.15);color:#dff;border:1px solid rgba(120,200,200,.3);border-radius:6px;cursor:pointer">重置為預設</button>`;
+  panel.innerHTML = html;
+  document.body.appendChild(panel);
+  const vSel = panel.querySelector('[data-key="bgVideo"]'); if (vSel) vSel.value = CONFIG.bgVideo;
+
+  function applyAct(act) {
+    if (act === 'flora') buildFlora();
+    else if (act === 'fish') buildFish();
+    else if (act === 'weeds') buildWeeds();
+    else if (act === 'swirls') buildSwirls();
+    else if (act === 'water') waterTex = makeWaterTexture(1050, 450, CONFIG.bgA, CONFIG.bgB);
+    else if (act === 'light') relightFlora();
+    else if (act === 'video') startBgVideos();
+    else if (act === 'rate') { const v = currentBgVideo(); if (v) v.playbackRate = clamp(CONFIG.bgVideoRate, 0.1, 4); }
+  }
+  panel.addEventListener('input', (e) => {
+    const el = e.target, key = el.getAttribute('data-key');
+    if (!key) return;
+    if (el.type === 'range') CONFIG[key] = parseFloat(el.value);
+    else if (el.tagName === 'SELECT') CONFIG[key] = parseInt(el.value, 10);
+    else CONFIG[key] = el.value;                 // color
+    const out = panel.querySelector(`[data-out="${key}"]`);
+    if (out) out.textContent = (el.type === 'range') ? CONFIG[key] : '';
+    saveConfig();
+    applyAct(el.getAttribute('data-act'));
+  });
+  panel.querySelector('#edReset').addEventListener('click', () => {
+    Object.assign(CONFIG, DEFAULT_CONFIG); saveConfig();
+    panel.querySelectorAll('input').forEach((el) => {
+      const k = el.getAttribute('data-key'); if (!k) return;
+      el.value = CONFIG[k];
+      const out = panel.querySelector(`[data-out="${k}"]`); if (out) out.textContent = CONFIG[k];
+    });
+    if (vSel) vSel.value = CONFIG.bgVideo;
+    buildFlora(); buildFish(); buildWeeds(); buildSwirls();
+    waterTex = makeWaterTexture(1050, 450, CONFIG.bgA, CONFIG.bgB);
+    startBgVideos();
+  });
+
+  let open = false;
+  addEventListener('keydown', (e) => {
+    if (e.key === 'e' || e.key === 'E') { open = !open; panel.style.transform = open ? 'translateX(0)' : 'translateX(100%)'; }
+  });
+}
+
+/* --- 依設定建立初始場景 --- */
+buildFlora();
+buildFish();
+buildWeeds();
+buildSwirls();
+buildEditor();
+
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
