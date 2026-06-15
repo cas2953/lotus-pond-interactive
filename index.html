@@ -90,8 +90,13 @@ const DEFAULT_CONFIG = {
   bloomCount: 3,         // 「會開合的花苞」數量(其餘為靜態花)
   bloomRest: 0.38,       // 花苞靜止開度(0=全閉 1=全開)；預設半閉合
   bloomHold: 2.6,        // 被觸碰後維持盛開的秒數(定格感)
-  bloomSpeed: 1.0,       // 開合動畫速度
+  bloomOpenSpeed: 0.4,   // 盛開(展開)速度——越小越慢、越優雅(可調)
+  bloomSpeed: 1.0,       // 闔合(收回)速度
   bloomBlur: 4,          // 開合動態模糊取樣數(1=關；越大越絲滑，靜止時自動清晰)
+  goldAmount: 1.0,       // 綻放時從花心散發的金色粒子量(0=關)
+  goldColor: '#ffd24d',  // 金光顏色
+  goldSize: 1.0,         // 金光粒子大小
+  goldSpeed: 1.0,        // 金光散開速度
   flowerTopBias: 0.82,   // 花朵採用「垂直上視(0°)」貼圖的比例(多數正俯視)
   flowerTilt: 0.0,       // 花朵額外傾角(2.5D 壓扁；0=維持渲染時的角度)
   lightAngle: 135,       // 花朵光照方向(度；於貼圖上疊方向性明暗)
@@ -114,6 +119,27 @@ const DEFAULT_CONFIG = {
 let CONFIG = Object.assign({}, DEFAULT_CONFIG);
 try { CONFIG = Object.assign(CONFIG, JSON.parse(localStorage.getItem('pondConfig') || '{}')); } catch (e) {}
 function saveConfig() { try { localStorage.setItem('pondConfig', JSON.stringify(CONFIG)); } catch (e) {} }
+
+// 預設值（可被專案根目錄的 config.json 覆蓋；編輯器「重置」會回到這裡）
+let baseConfig = Object.assign({}, DEFAULT_CONFIG);
+const hadSavedConfig = !!localStorage.getItem('pondConfig');
+let syncEditor = null;                       // buildEditor 指派：把 CONFIG 同步回面板控制項
+function rebuildAll() {
+  buildFlora(); buildFish(); buildWeeds(); buildSwirls();
+  waterTex = makeWaterTexture(1050, 450, CONFIG.bgA, CONFIG.bgB);
+  startBgVideos();
+  if (typeof syncEditor === 'function') syncEditor();
+}
+// 啟動時若有 config.json → 當成新的「預設值」(丟進專案即生效)；無在地調整時直接套用
+async function loadConfigFile() {
+  try {
+    const r = await fetch('config.json', { cache: 'no-store' });
+    if (!r.ok) return;
+    const fileCfg = await r.json();
+    baseConfig = Object.assign({}, DEFAULT_CONFIG, fileCfg);
+    if (!hadSavedConfig) { Object.assign(CONFIG, fileCfg); rebuildAll(); }
+  } catch (e) { /* 無 config.json：用內建預設 */ }
+}
 
 // 已載入的 3D 精靈圖（供場景重建時重新指派）
 const ASSET = { flowers: [], flowersTop: [], flowersTilt: [], leaves: [], fishSets: [], bloomSets: [] };
@@ -817,6 +843,36 @@ function drawFlashes(g, elapsed) {
 }
 
 /* ============================================================
+   綻放金光（花心散發的金色粒子，水面層、加法混色）
+   ============================================================ */
+const goldParticles = [];
+function emitGold(x, y) {
+  if (goldParticles.length > 1600) return;                 // 上限保護
+  const a = rand(0, TAU), sp = rand(0.2, 1.1) * CONFIG.goldSpeed;
+  goldParticles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - rand(0.1, 0.5) * CONFIG.goldSpeed,
+    t: 0, life: rand(700, 1700), size: rand(1.4, 3.6) * CONFIG.goldSize });
+}
+function drawGold(g, elapsed) {
+  if (!goldParticles.length) return;
+  const col = hexToRgb(CONFIG.goldColor), f = elapsed / 16.67;
+  g.globalCompositeOperation = 'lighter';
+  for (let i = goldParticles.length - 1; i >= 0; i--) {
+    const p = goldParticles[i]; p.t += elapsed;
+    const k = p.t / p.life;
+    if (k >= 1) { goldParticles.splice(i, 1); continue; }
+    p.x += p.vx * f; p.y += p.vy * f; p.vy += 0.006 * f;     // 緩緩飄落
+    p.vx *= 0.985; p.vy *= 0.985;
+    const a = 1 - k, r = p.size * (0.8 + k * 1.3);
+    const gr = g.createRadialGradient(p.x, p.y, 0, p.x, p.y, r * 3.2);
+    gr.addColorStop(0, `rgba(${col.r},${col.g},${col.b},${0.9 * a})`);
+    gr.addColorStop(0.4, `rgba(${col.r},${col.g},${col.b},${0.32 * a})`);
+    gr.addColorStop(1, `rgba(${col.r},${col.g},${col.b},0)`);
+    g.fillStyle = gr; g.beginPath(); g.arc(p.x, p.y, r * 3.2, 0, TAU); g.fill();
+  }
+  g.globalCompositeOperation = 'source-over';
+}
+
+/* ============================================================
    音效（Web Audio 即時合成）
    ============================================================ */
 let audioCtx = null, ambientGain = null, soundOn = true;
@@ -836,28 +892,82 @@ function initAudio() {
   lfo.frequency.value = 0.13; lfoGain.gain.value = 0.02;
   lfo.connect(lfoGain); lfoGain.connect(ambientGain.gain); lfo.start();
   src.connect(lp); lp.connect(ambientGain); ambientGain.connect(audioCtx.destination); src.start();
+  loadWaterSamples();
 }
+// 真實水聲樣本（輕踩水面/入水/水花），隨機不重複播放→不單調；載不到時退回下方合成
+const WATER_FILES = ['assets/audio/water1.mp3', 'assets/audio/water2.mp3', 'assets/audio/water3.mp3', 'assets/audio/water4.mp3', 'assets/audio/water5.mp3'];
+const waterSamples = [];
+let lastWaterIdx = -1;
+async function loadWaterSamples() {
+  if (waterSamples.length || !audioCtx) return;
+  for (const url of WATER_FILES) {
+    try {
+      const r = await fetch(url); if (!r.ok) continue;
+      waterSamples.push(await audioCtx.decodeAudioData(await r.arrayBuffer()));
+    } catch (e) { /* 載不到就用合成後備 */ }
+  }
+}
+function playWaterSample(volume) {
+  let i = Math.floor(Math.random() * waterSamples.length);
+  if (waterSamples.length > 1 && i === lastWaterIdx) i = (i + 1) % waterSamples.length;  // 不連續重複
+  lastWaterIdx = i;
+  const src = audioCtx.createBufferSource(); src.buffer = waterSamples[i];
+  src.playbackRate.value = rand(0.9, 1.12);                 // 微幅變調→更多變化
+  const g = audioCtx.createGain();
+  g.gain.value = clamp(rand(0.4, 0.6) * volume, 0, 1);      // 輕柔
+  src.connect(g); g.connect(audioCtx.destination); src.start();
+}
+
+// 共用白噪音緩衝（水花皆由濾波噪音合成，較自然）
+let splashNoise = null;
+function getSplashNoise() {
+  if (splashNoise) return splashNoise;
+  const len = Math.floor(audioCtx.sampleRate * 1.2);
+  splashNoise = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+  const d = splashNoise.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  return splashNoise;
+}
+// 「輕踩水面 / 走在湖中」的水花聲：柔和起音 + 淡出，且每次參數隨機 → 不重複
 function playDrop(volume = 1) {
   if (!audioCtx || !soundOn) return;
+  if (waterSamples.length) { playWaterSample(volume); return; }   // 優先用真實水聲樣本
   const t = audioCtx.currentTime;
-  const osc = audioCtx.createOscillator(); const og = audioCtx.createGain();
-  const f0 = rand(520, 760);
-  osc.type = 'sine';
-  osc.frequency.setValueAtTime(f0, t);
-  osc.frequency.exponentialRampToValueAtTime(f0 * 0.32, t + 0.16);
-  og.gain.setValueAtTime(0.0001, t);
-  og.gain.exponentialRampToValueAtTime(0.28 * volume, t + 0.012);
-  og.gain.exponentialRampToValueAtTime(0.0001, t + 0.32);
-  osc.connect(og); og.connect(audioCtx.destination); osc.start(t); osc.stop(t + 0.4);
-  const nb = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.1, audioCtx.sampleRate);
-  const nd = nb.getChannelData(0);
-  for (let i = 0; i < nd.length; i++) nd[i] = (Math.random()*2-1) * (1 - i/nd.length);
-  const ns = audioCtx.createBufferSource(); ns.buffer = nb;
-  const hp = audioCtx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=1800;
-  const ng = audioCtx.createGain();
-  ng.gain.setValueAtTime(0.09 * volume, t);
-  ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.1);
-  ns.connect(hp); hp.connect(ng); ng.connect(audioCtx.destination); ns.start(t);
+  const buf = getSplashNoise(), dur = buf.duration;
+  const master = audioCtx.createGain(); master.gain.value = 0.9 * volume; master.connect(audioCtx.destination);
+
+  // 主體：低通噪音的柔和水花，慢慢淡出（Fade Out）
+  const bodyDur = rand(0.4, 0.85);
+  const body = audioCtx.createBufferSource(); body.buffer = buf;
+  body.playbackRate.value = rand(0.8, 1.25);
+  if (dur - 0.05 > bodyDur) body.loopEnd = dur; // 確保夠長
+  const lp = audioCtx.createBiquadFilter(); lp.type = 'lowpass';
+  lp.frequency.setValueAtTime(rand(900, 1500), t);
+  lp.frequency.exponentialRampToValueAtTime(rand(280, 520), t + bodyDur);   // 漸暗→更像水
+  lp.Q.value = rand(0.4, 1.0);
+  const bg = audioCtx.createGain();
+  bg.gain.setValueAtTime(0.0001, t);
+  bg.gain.exponentialRampToValueAtTime(0.13, t + rand(0.015, 0.05));         // 柔和起音
+  bg.gain.exponentialRampToValueAtTime(0.0001, t + bodyDur);                 // 淡出
+  body.connect(lp); lp.connect(bg); bg.connect(master);
+  body.start(t, rand(0, 0.4)); body.stop(t + bodyDur + 0.1);
+
+  // 水珠飛濺：隨機顆數、頻率、時間點的高頻短 ping → 每次都不一樣
+  const drops = Math.floor(rand(2, 7));
+  for (let i = 0; i < drops; i++) {
+    const dt0 = rand(0, 0.18);
+    const ds = audioCtx.createBufferSource(); ds.buffer = buf;
+    ds.playbackRate.value = rand(0.9, 1.5);
+    const bp = audioCtx.createBiquadFilter(); bp.type = 'bandpass';
+    bp.frequency.value = rand(1500, 3800); bp.Q.value = rand(3, 9);
+    const dg = audioCtx.createGain();
+    const amp = rand(0.02, 0.055);
+    dg.gain.setValueAtTime(0.0001, t + dt0);
+    dg.gain.exponentialRampToValueAtTime(amp, t + dt0 + 0.006);
+    dg.gain.exponentialRampToValueAtTime(0.0001, t + dt0 + rand(0.08, 0.2));  // 各自淡出
+    ds.connect(bp); bp.connect(dg); dg.connect(master);
+    ds.start(t + dt0, rand(0, 0.6)); ds.stop(t + dt0 + 0.3);
+  }
 }
 soundBtn.addEventListener('click', (e) => {
   e.stopPropagation();
@@ -886,8 +996,11 @@ function trigger(clientX, clientY, strength = 1) {
   addDrop(sx, sy, lerp(8, 16, strength), lerp(360, 620, strength) * CONFIG.rippleStrength);
   spawnFlash(x, y, strength);
   for (const f of fishes) f.scare(x, y);
-  for (const it of flora) if (it.isBloom) {           // 觸碰附近的花苞→綻放並定格
-    if (Math.hypot(it.x - x, it.y - y) < 520) it.openHold = Math.max(it.openHold || 0, CONFIG.bloomHold * 1000);
+  for (const it of flora) if (it.isBloom) {           // 觸碰附近的花苞→綻放並定格＋金光迸發
+    if (Math.hypot(it.x - x, it.y - y) < 520) {
+      it.openHold = Math.max(it.openHold || 0, CONFIG.bloomHold * 1000);
+      for (let b = 0; b < Math.round(CONFIG.goldAmount * 16); b++) emitGold(it.x, it.y);
+    }
   }
   initAudio();
   if (audioCtx.state === 'suspended') audioCtx.resume();
@@ -1042,10 +1155,16 @@ function frame(now) {
       // 靜止維持半閉合(bloomRest)；被觸碰後 openHold 秒內保持盛開(定格)，之後緩緩闔回
       if (it.openHold > 0) it.openHold -= elapsed;
       const target = it.openHold > 0 ? 1 : CONFIG.bloomRest;
-      const rate = clamp(0.06 * CONFIG.bloomSpeed * drift * dt, 0, 1);
       if (it.open == null) it.open = CONFIG.bloomRest;
+      const spd = (target > it.open) ? CONFIG.bloomOpenSpeed : CONFIG.bloomSpeed;   // 展開較慢、收回較快(皆可調)
+      const rate = clamp(0.06 * spd * drift * dt, 0, 1);
       const prevOpen = it.open;
       it.open += (target - it.open) * rate;
+      // 綻放時從花心散發金色粒子(花的金光)
+      if (CONFIG.goldAmount > 0.01 && it.open > 0.5) {
+        it.goldAcc = (it.goldAcc || 0) + CONFIG.goldAmount * (it.open - 0.5) * 2 * (elapsed / 16.67) * 0.5;
+        while (it.goldAcc >= 1) { it.goldAcc -= 1; emitGold(it.x + it.bobX, it.y + it.bobY); }
+      }
       // 動態模糊：在 prevOpen→open 間取樣數張，用「跑動平均(alpha=1/(k+1))」疊出運動殘影
       // → 開合越快越絲滑、靜止(prevOpen≈open)時自動清晰，不需重渲
       const blur = Math.max(1, CONFIG.bloomBlur | 0);
@@ -1082,10 +1201,11 @@ function frame(now) {
     ctx.restore();
   }
 
-  /* --- 觸碰閃光 --- */
+  /* --- 觸碰閃光 + 綻放金光粒子 --- */
   ctx.globalCompositeOperation = 'lighter';
   drawFlashes(ctx, elapsed);
   ctx.globalCompositeOperation = 'source-over';
+  drawGold(ctx, elapsed);
 
   /* --- 邊緣黑色暈影 --- */
   const vg = ctx.createRadialGradient(DESIGN_W/2, DESIGN_H/2, DESIGN_H*0.42, DESIGN_W/2, DESIGN_H/2, DESIGN_W*0.58);
@@ -1121,8 +1241,9 @@ function buildEditor() {
   const groups = [
     ['花', [['flowerCount','數量',0,40,1,'flora'],['flowerDensity','密度',0,1,0.01,'flora'],['flowerSize','大小',0.4,2,0.05,'live'],
             ['flowerTopBias','垂直上視比例',0,1,0.02,'flora'],
-            ['bloomCount','開合花苞數',0,12,1,'flora'],['bloomRest','花苞靜止開度',0,1,0.02,'live'],['bloomHold','觸發停留(秒)',0.5,6,0.1,'live'],['bloomSpeed','開合速度',0.2,3,0.05,'live'],['bloomBlur','開合動態模糊',1,8,1,'live'],
+            ['bloomCount','開合花苞數',0,12,1,'flora'],['bloomRest','花苞靜止開度',0,1,0.02,'live'],['bloomHold','觸發停留(秒)',0.5,6,0.1,'live'],['bloomOpenSpeed','盛開速度(越小越慢)',0.05,2,0.05,'live'],['bloomSpeed','闔合速度',0.2,3,0.05,'live'],['bloomBlur','開合動態模糊',1,8,1,'live'],
             ['flowerTilt','傾角(2.5D 壓扁)',0,0.5,0.01,'live'],['lightAngle','光照方向(度)',0,360,1,'light'],['lightStrength','光照強度',0,2,0.05,'light']]],
+    ['綻放金光', [['goldAmount','金光粒子量',0,3,0.05,'live'],['goldSize','金光大小',0.3,3,0.05,'live'],['goldSpeed','散開速度',0.2,3,0.05,'live']]],
     ['葉', [['leafCount','數量',0,40,1,'flora'],['leafDensity','密度',0,1,0.01,'flora'],['leafSize','大小',0.4,2,0.05,'live']]],
     ['魚', [['fishCount','數量',0,40,1,'fish'],['fishSpeed','巡游速度',0.2,3,0.05,'live'],['fishReact','受驚反應速度',0.2,3,0.05,'live'],['fishSize','大小',0.4,2,0.05,'live']]],
     ['水草', [['weedCount','數量',0,40,1,'weeds'],['weedBlur','水面下模糊',0,6,0.2,'live']]],
@@ -1141,8 +1262,9 @@ function buildEditor() {
         + `</label>`;
     }
   }
-  // 花·光照顏色（暖陽光，可調）
-  html += `<label style="display:flex;justify-content:space-between;align-items:center;margin:7px 0">花·光照顏色 <input type="color" data-key="lightColor" data-act="light" value="${CONFIG.lightColor}"></label>`;
+  // 花·光照顏色 + 綻放金光顏色（皆可調）
+  html += `<label style="display:flex;justify-content:space-between;align-items:center;margin:7px 0">花·光照顏色 <input type="color" data-key="lightColor" data-act="light" value="${CONFIG.lightColor}"></label>`
+    + `<label style="display:flex;justify-content:space-between;align-items:center;margin:7px 0">金光顏色 <input type="color" data-key="goldColor" data-act="live" value="${CONFIG.goldColor}"></label>`;
   // 影片選擇 + 染色 + 後備漸層底色
   html += `<label style="display:flex;justify-content:space-between;align-items:center;margin:7px 0">底圖影片`
     + `<select data-key="bgVideo" data-act="video" style="background:#0a2a2e;color:#dff;border:1px solid rgba(120,200,200,.3);border-radius:4px;padding:2px 6px">`
@@ -1151,10 +1273,22 @@ function buildEditor() {
     + `<div style="margin:13px 0 4px;font-weight:700;color:#9fe;border-bottom:1px solid rgba(120,200,200,.2);padding-bottom:3px">後備底色（無影片時）</div>`
     + `<label style="display:flex;justify-content:space-between;align-items:center;margin:7px 0">中心色 <input type="color" data-key="bgA" data-act="water" value="${CONFIG.bgA}"></label>`
     + `<label style="display:flex;justify-content:space-between;align-items:center;margin:7px 0">邊緣色 <input type="color" data-key="bgB" data-act="water" value="${CONFIG.bgB}"></label>`
-    + `<button id="edReset" style="margin-top:16px;width:100%;padding:8px;background:rgba(120,200,200,.15);color:#dff;border:1px solid rgba(120,200,200,.3);border-radius:6px;cursor:pointer">重置為預設</button>`;
+    + `<button id="edReset" style="margin-top:16px;width:100%;padding:8px;background:rgba(120,200,200,.15);color:#dff;border:1px solid rgba(120,200,200,.3);border-radius:6px;cursor:pointer">重置為預設</button>`
+    + `<button id="edExport" style="margin-top:8px;width:100%;padding:8px;background:rgba(210,170,80,.2);color:#ffeec0;border:1px solid rgba(225,190,110,.45);border-radius:6px;cursor:pointer">⬇ 匯出設定檔 (config.json)</button>`
+    + `<button id="edImport" style="margin-top:8px;width:100%;padding:8px;background:rgba(120,200,200,.1);color:#dff;border:1px solid rgba(120,200,200,.3);border-radius:6px;cursor:pointer">⬆ 匯入設定檔…</button>`
+    + `<input id="edImportFile" type="file" accept="application/json,.json" style="display:none">`
+    + `<div style="opacity:.5;font-size:10.5px;margin-top:8px;line-height:1.6">匯出的 config.json 放進專案根目錄，即成為這個展項的預設值。</div>`;
   panel.innerHTML = html;
   document.body.appendChild(panel);
   const vSel = panel.querySelector('[data-key="bgVideo"]'); if (vSel) vSel.value = CONFIG.bgVideo;
+  // 供 rebuildAll / 匯入 / 重置 用：把 CONFIG 同步回所有控制項
+  syncEditor = function () {
+    panel.querySelectorAll('input,select').forEach((el) => {
+      const k = el.getAttribute('data-key'); if (!k) return;
+      el.value = CONFIG[k];
+      const out = panel.querySelector(`[data-out="${k}"]`); if (out && el.type === 'range') out.textContent = CONFIG[k];
+    });
+  };
 
   function applyAct(act) {
     if (act === 'flora') buildFlora();
@@ -1178,16 +1312,22 @@ function buildEditor() {
     applyAct(el.getAttribute('data-act'));
   });
   panel.querySelector('#edReset').addEventListener('click', () => {
-    Object.assign(CONFIG, DEFAULT_CONFIG); saveConfig();
-    panel.querySelectorAll('input').forEach((el) => {
-      const k = el.getAttribute('data-key'); if (!k) return;
-      el.value = CONFIG[k];
-      const out = panel.querySelector(`[data-out="${k}"]`); if (out) out.textContent = CONFIG[k];
-    });
-    if (vSel) vSel.value = CONFIG.bgVideo;
-    buildFlora(); buildFish(); buildWeeds(); buildSwirls();
-    waterTex = makeWaterTexture(1050, 450, CONFIG.bgA, CONFIG.bgB);
-    startBgVideos();
+    Object.assign(CONFIG, JSON.parse(JSON.stringify(baseConfig))); saveConfig();   // 回到預設(config.json 或內建)
+    rebuildAll();
+  });
+  // 匯出目前所有設定為 config.json（之後丟進專案即成為預設值）
+  panel.querySelector('#edExport').addEventListener('click', () => {
+    const blob = new Blob([JSON.stringify(CONFIG, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'config.json';
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+  });
+  const impFile = panel.querySelector('#edImportFile');
+  panel.querySelector('#edImport').addEventListener('click', () => impFile.click());
+  impFile.addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0]; if (!f) return;
+    const rd = new FileReader();
+    rd.onload = () => { try { Object.assign(CONFIG, JSON.parse(rd.result)); saveConfig(); rebuildAll(); } catch (err) { alert('設定檔格式錯誤'); } };
+    rd.readAsText(f); e.target.value = '';
   });
 
   addEventListener('keydown', (e) => {
@@ -1205,6 +1345,7 @@ buildFish();
 buildWeeds();
 buildSwirls();
 buildEditor();
+loadConfigFile();        // 若專案有 config.json → 套用為預設值
 
 resize();
 requestAnimationFrame(frame);

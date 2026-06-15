@@ -1,6 +1,8 @@
-# --- 原始素材大檔（部署用不到；已壓成 assets/video/*.mp4 與 assets/sprites/*.png） ---
+# --- 原始素材大檔（部署用不到；已壓成 assets/video/*.mp4、assets/sprites/*.png、assets/audio/*.mp3） ---
 *.mov
+*.zip
 model/
+audio_src/
 
 # --- 開發/驗證暫存 ---
 verify*.png
