@@ -85,36 +85,42 @@ const FISH_IMG_SCALE = 1.5;       // 對應 render_assets.py 的 FISH_MARGIN
 /* ============================================================
    可調設定（前台編輯器 E 鍵；存於 localStorage）
    ============================================================ */
+// 預設值＝現場調校後的設定（與專案根目錄 config.json 同步）
 const DEFAULT_CONFIG = {
-  flowerCount: 9,  flowerDensity: 0.45, flowerSize: 1.0,
-  bloomCount: 3,         // 「會開合的花苞」數量(其餘為靜態花)
+  flowerCount: 24, flowerDensity: 0.27, flowerSize: 1.05,
+  bloomCount: 12,        // 「會開合的花苞」數量(其餘為靜態花)
   bloomRest: 0.38,       // 花苞靜止開度(0=全閉 1=全開)；預設半閉合
-  bloomHold: 2.6,        // 被觸碰後維持盛開的秒數(定格感)
-  bloomOpenSpeed: 0.4,   // 盛開(展開)速度——越小越慢、越優雅(可調)
-  bloomSpeed: 1.0,       // 闔合(收回)速度
-  bloomBlur: 4,          // 開合動態模糊取樣數(1=關；越大越絲滑，靜止時自動清晰)
-  goldAmount: 1.0,       // 綻放時從花心散發的金色粒子量(0=關)
+  bloomHold: 6,          // 被觸碰後維持盛開的秒數(定格感)
+  bloomOpenSpeed: 0.15,  // 盛開(展開)速度——越小越慢、越優雅(可調)
+  bloomSpeed: 1,         // 闔合(收回)速度
+  bloomBlur: 6,          // 開合動態模糊取樣數(1=關；越大越絲滑，靜止時自動清晰)
+  goldAmount: 0.3,       // 綻放時從花心散發的金色粒子量(0=關)
   goldColor: '#ffd24d',  // 金光顏色
-  goldSize: 1.0,         // 金光粒子大小
-  goldSpeed: 1.0,        // 金光散開速度
+  goldSize: 0.4,         // 金光粒子大小
+  goldSpeed: 1.6,        // 金光散開速度
   flowerTopBias: 0.82,   // 花朵採用「垂直上視(0°)」貼圖的比例(多數正俯視)
-  flowerTilt: 0.0,       // 花朵額外傾角(2.5D 壓扁；0=維持渲染時的角度)
+  flowerTilt: 0,         // 花朵額外傾角(2.5D 壓扁；0=維持渲染時的角度)
   lightAngle: 135,       // 花朵光照方向(度；於貼圖上疊方向性明暗)
   lightColor: '#ffe6bd', // 花朵受光側暖光顏色(可調，預設暖陽光)
-  lightStrength: 1.0,    // 花朵方向性打光強度
-  leafCount: 9,    leafDensity: 0.45,   leafSize: 1.0,
-  fishCount: 9,    fishSpeed: 1.0,      fishReact: 1.0,  fishSize: 1.0,
-  weedCount: 10,   weedBlur: 2.2,
-  swirlCount: 40,
-  rippleStrength: 1.0,
-  swayDamping: 0.95,     // 越大→搖晃越持久柔和（低阻尼）
-  swayAmp: 0.55,         // 初始搖晃幅度（越小→點擊瞬間擺動越含蓄）
+  lightStrength: 1,      // 花朵方向性打光強度
+  leafCount: 16,   leafDensity: 0.28,   leafSize: 1.1,
+  fishCount: 29,   fishSpeed: 0.75,     fishReact: 1.45, fishSize: 0.7,
+  weedCount: 14,   weedBlur: 6,
+  swirlCount: 10,
+  rippleStrength: 0.55,
+  swayDamping: 0.965,    // 越大→搖晃越持久柔和（低阻尼）
+  swayAmp: 0.3,          // 初始搖晃幅度（越小→點擊瞬間擺動越含蓄）
   bgVideo: 0,            // 背景影片：0=波紋均勻 / 1=有陽光束
   bgVideoRate: 0.8,      // 影片播放速率
   bgTint: '#3f9b86',     // 影片染色（正片疊底→染成荷塘青綠）
-  bgOverlay: 1.0,        // 程式波紋疊加強度
+  bgOverlay: 2,          // 程式波紋疊加強度
   bgA: '#1d5e62',        // 無影片時的後備：背景中心色
   bgB: '#08252c',        // 無影片時的後備：背景邊緣色
+  edgeSize: 0.93,        // 池塘邊緣大小(佔畫面比例；越大越滿版)
+  edgeBlur: 26,          // 邊緣模糊/羽化程度(越大越柔)
+  edgeWobble: 1,         // 邊緣不規則波動幅度(池塘有機形狀)
+  edgeSpeed: 1,          // 邊緣飄動速度
+  edgeGlow: 0.5,         // 邊緣柔光忽明忽暗強度(0=關)
 };
 let CONFIG = Object.assign({}, DEFAULT_CONFIG);
 try { CONFIG = Object.assign(CONFIG, JSON.parse(localStorage.getItem('pondConfig') || '{}')); } catch (e) {}
@@ -181,6 +187,9 @@ const bufCanvas = document.createElement('canvas');
 const bufCtx = bufCanvas.getContext('2d', { willReadFrequently: true });
 const weedCanvas = document.createElement('canvas');     // 水草離屏層（模糊後貼回）
 const weedCtx = weedCanvas.getContext('2d');
+const edgeCanvas = document.createElement('canvas');     // 池塘柔邊遮罩（有機形狀＋模糊）
+edgeCanvas.width = 768; edgeCanvas.height = 330;
+const edgeCtx = edgeCanvas.getContext('2d');
 let waterImage = null, srcImage = null;
 
 function resize() {
@@ -1063,6 +1072,41 @@ function ambientRipple(elapsed) {
 }
 
 /* ============================================================
+   池塘柔邊：有機(非矩形)、模糊羽化、緩慢飄動、忽明忽暗的邊緣
+   ============================================================ */
+const edgePts = [];
+function computeEdgePts(now) {
+  const t = now * 0.0004 * CONFIG.edgeSpeed;
+  const cx = DESIGN_W / 2, cy = DESIGN_H / 2;
+  const baseRx = DESIGN_W * 0.5 * CONFIG.edgeSize, baseRy = DESIGN_H * 0.5 * CONFIG.edgeSize;
+  const n = 3.2, steps = 150, w = CONFIG.edgeWobble;            // n=超橢圓指數(圓角寬版，貼合寬螢幕)
+  edgePts.length = 0;
+  for (let i = 0; i <= steps; i++) {
+    const a = i / steps * TAU, ca = Math.cos(a), sa = Math.sin(a);
+    // 多諧波疊加→有機不規則；相位隨時間漂移→邊緣緩緩飄動
+    const wob = 1 + w * (0.055 * Math.sin(3 * a + t * 1.3) + 0.04 * Math.sin(5 * a - t * 0.9 + 1.7)
+                       + 0.03 * Math.sin(2 * a + t * 0.6) + 0.022 * Math.sin(7 * a + t * 1.1));
+    const rx = baseRx * wob, ry = baseRy * wob;
+    edgePts.push(cx + Math.sign(ca) * Math.pow(Math.abs(ca), 2 / n) * rx,
+                 cy + Math.sign(sa) * Math.pow(Math.abs(sa), 2 / n) * ry);
+  }
+}
+function renderEdgeMask() {
+  const W = edgeCanvas.width, H = edgeCanvas.height, sx = W / DESIGN_W, sy = H / DESIGN_H;
+  edgeCtx.setTransform(1, 0, 0, 1, 0, 0);
+  edgeCtx.clearRect(0, 0, W, H);
+  edgeCtx.filter = `blur(${CONFIG.edgeBlur}px)`;                 // 羽化＝模糊邊緣(非銳利)
+  edgeCtx.fillStyle = '#fff';
+  edgeCtx.beginPath();
+  for (let i = 0; i < edgePts.length; i += 2) {
+    const x = edgePts[i] * sx, y = edgePts[i + 1] * sy;
+    i === 0 ? edgeCtx.moveTo(x, y) : edgeCtx.lineTo(x, y);
+  }
+  edgeCtx.closePath(); edgeCtx.fill();
+  edgeCtx.filter = 'none';
+}
+
+/* ============================================================
    主迴圈
    ============================================================ */
 let lastTime = performance.now();
@@ -1207,13 +1251,32 @@ function frame(now) {
   ctx.globalCompositeOperation = 'source-over';
   drawGold(ctx, elapsed);
 
-  /* --- 邊緣黑色暈影 --- */
-  const vg = ctx.createRadialGradient(DESIGN_W/2, DESIGN_H/2, DESIGN_H*0.42, DESIGN_W/2, DESIGN_H/2, DESIGN_W*0.58);
+  /* --- 內部柔暈影（加深層次，配合柔邊） --- */
+  const vg = ctx.createRadialGradient(DESIGN_W/2, DESIGN_H/2, DESIGN_H*0.40, DESIGN_W/2, DESIGN_H/2, DESIGN_W*0.60);
   vg.addColorStop(0, 'rgba(0,0,0,0)');
-  vg.addColorStop(0.62, 'rgba(0,0,0,0.22)');
-  vg.addColorStop(1, 'rgba(0,0,0,1)');
+  vg.addColorStop(0.7, 'rgba(0,0,0,0.18)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.6)');
   ctx.fillStyle = vg;
   ctx.fillRect(-100, -100, DESIGN_W + 200, DESIGN_H + 200);
+
+  /* --- 池塘柔邊：有機形狀遮罩(模糊羽化、緩慢飄動) + 忽明忽暗的邊緣柔光 --- */
+  computeEdgePts(now);
+  renderEdgeMask();
+  ctx.globalCompositeOperation = 'destination-in';      // 只保留池塘形狀內；邊緣因模糊而柔和淡出
+  ctx.drawImage(edgeCanvas, 0, 0, edgeCanvas.width, edgeCanvas.height, 0, 0, DESIGN_W, DESIGN_H);
+  ctx.globalCompositeOperation = 'source-over';
+  if (CONFIG.edgeGlow > 0.01) {
+    const pulse = 0.55 + 0.45 * Math.sin(now * 0.0009);   // 緩慢柔和的忽明忽暗
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.filter = 'blur(9px)';
+    ctx.strokeStyle = `rgba(150,232,220,${CONFIG.edgeGlow * 0.16 * pulse})`;
+    ctx.lineWidth = 22; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    for (let i = 0; i < edgePts.length; i += 2) { i === 0 ? ctx.moveTo(edgePts[i], edgePts[i + 1]) : ctx.lineTo(edgePts[i], edgePts[i + 1]); }
+    ctx.closePath(); ctx.stroke();
+    ctx.filter = 'none';
+    ctx.globalCompositeOperation = 'source-over';
+  }
 
   if (_capFrames !== Infinity && _capFrames === 60 && !window._capDone) {
     window._capDone = true;                       // 截圖驗證：把畫面快照成靜態 <img>，避免 headless 不合成 live canvas
@@ -1239,16 +1302,17 @@ function buildEditor() {
     + 'border-left:1px solid rgba(120,200,200,.25);z-index:50;transform:translateX(100%);'
     + 'transition:transform .25s;box-shadow:-8px 0 30px rgba(0,0,0,.45)';
   const groups = [
-    ['花', [['flowerCount','數量',0,40,1,'flora'],['flowerDensity','密度',0,1,0.01,'flora'],['flowerSize','大小',0.4,2,0.05,'live'],
+    ['花', [['flowerCount','數量',0,80,1,'flora'],['flowerDensity','密度',0,1,0.01,'flora'],['flowerSize','大小',0.2,4,0.05,'live'],
             ['flowerTopBias','垂直上視比例',0,1,0.02,'flora'],
-            ['bloomCount','開合花苞數',0,12,1,'flora'],['bloomRest','花苞靜止開度',0,1,0.02,'live'],['bloomHold','觸發停留(秒)',0.5,6,0.1,'live'],['bloomOpenSpeed','盛開速度(越小越慢)',0.05,2,0.05,'live'],['bloomSpeed','闔合速度',0.2,3,0.05,'live'],['bloomBlur','開合動態模糊',1,8,1,'live'],
-            ['flowerTilt','傾角(2.5D 壓扁)',0,0.5,0.01,'live'],['lightAngle','光照方向(度)',0,360,1,'light'],['lightStrength','光照強度',0,2,0.05,'light']]],
-    ['綻放金光', [['goldAmount','金光粒子量',0,3,0.05,'live'],['goldSize','金光大小',0.3,3,0.05,'live'],['goldSpeed','散開速度',0.2,3,0.05,'live']]],
-    ['葉', [['leafCount','數量',0,40,1,'flora'],['leafDensity','密度',0,1,0.01,'flora'],['leafSize','大小',0.4,2,0.05,'live']]],
-    ['魚', [['fishCount','數量',0,40,1,'fish'],['fishSpeed','巡游速度',0.2,3,0.05,'live'],['fishReact','受驚反應速度',0.2,3,0.05,'live'],['fishSize','大小',0.4,2,0.05,'live']]],
-    ['水草', [['weedCount','數量',0,40,1,'weeds'],['weedBlur','水面下模糊',0,6,0.2,'live']]],
-    ['漣漪 / 搖晃 / 背景光紋', [['rippleStrength','漣漪強度',0.3,2,0.05,'live'],['swayAmp','搖晃幅度(初始)',0.1,1.5,0.05,'live'],['swayDamping','搖晃阻尼(越大越持久)',0.85,0.99,0.005,'live'],['swirlCount','背景光紋數量',0,140,2,'swirls']]],
-    ['背景水面（影片底圖）', [['bgOverlay','程式波紋疊加',0,2,0.05,'live'],['bgVideoRate','影片播放速率',0.2,2,0.05,'rate']]],
+            ['bloomCount','開合花苞數',0,40,1,'flora'],['bloomRest','花苞靜止開度',0,1,0.02,'live'],['bloomHold','觸發停留(秒)',0.5,20,0.1,'live'],['bloomOpenSpeed','盛開速度(越小越慢)',0.02,3,0.01,'live'],['bloomSpeed','闔合速度',0.1,5,0.05,'live'],['bloomBlur','開合動態模糊',1,16,1,'live'],
+            ['flowerTilt','傾角(2.5D 壓扁)',0,0.8,0.01,'live'],['lightAngle','光照方向(度)',0,360,1,'light'],['lightStrength','光照強度',0,4,0.05,'light']]],
+    ['綻放金光', [['goldAmount','金光粒子量',0,8,0.05,'live'],['goldSize','金光大小',0.1,6,0.05,'live'],['goldSpeed','散開速度',0.1,6,0.05,'live']]],
+    ['葉', [['leafCount','數量',0,80,1,'flora'],['leafDensity','密度',0,1,0.01,'flora'],['leafSize','大小',0.2,4,0.05,'live']]],
+    ['魚', [['fishCount','數量',0,100,1,'fish'],['fishSpeed','巡游速度',0.05,6,0.05,'live'],['fishReact','受驚反應速度',0.1,6,0.05,'live'],['fishSize','大小',0.2,4,0.05,'live']]],
+    ['水草', [['weedCount','數量',0,100,1,'weeds'],['weedBlur','水面下模糊',0,16,0.2,'live']]],
+    ['漣漪 / 搖晃 / 背景光紋', [['rippleStrength','漣漪強度',0,4,0.05,'live'],['swayAmp','搖晃幅度(初始)',0,4,0.05,'live'],['swayDamping','搖晃阻尼(越大越持久)',0.7,0.995,0.005,'live'],['swirlCount','背景光紋數量',0,300,2,'swirls']]],
+    ['背景水面（影片底圖）', [['bgOverlay','程式波紋疊加',0,5,0.05,'live'],['bgVideoRate','影片播放速率',0.1,4,0.05,'rate']]],
+    ['池塘邊緣', [['edgeSize','邊緣大小',0.4,1.2,0.01,'live'],['edgeBlur','邊緣模糊',0,80,1,'live'],['edgeWobble','不規則波動',0,4,0.05,'live'],['edgeSpeed','飄動速度',0,4,0.05,'live'],['edgeGlow','邊緣柔光',0,2,0.05,'live']]],
   ];
   let html = '<div style="font-size:15px;letter-spacing:.12em;margin-bottom:2px">展項編輯器</div>'
     + '<div style="opacity:.55;margin-bottom:6px;font-size:12px">按 E 開關 ・ 設定自動儲存</div>'
